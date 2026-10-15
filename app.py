@@ -6,7 +6,8 @@ dead-letter handling, priority, validation, and full audit history.
 Built directly against the finalized Scope of Work (12 sections).
 """
 import asyncio, base64, csv, hashlib, hmac, io, json, logging, os, re, secrets, signal, sys
-import sqlite3, struct, threading, time
+import queue as _queue_mod
+import shutil, sqlite3, struct, threading, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,7 +24,9 @@ from typing import Optional, Dict, List
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
+APP_VERSION = "1.1.0"
 DB_PATH = Path("bridge.db")
+BACKUP_DIR = Path("backup")   # CSV copy of everything sent to IDMS (see BackupWriter)
 WEB_PORT = 8000
 RETRY_INTERVAL = 2
 STALE_TIMEOUT = 20  # seconds an MQTT publish can wait for a response before counted as failed
@@ -87,7 +90,12 @@ CREATE TABLE IF NOT EXISTS meters (
 );
 CREATE TABLE IF NOT EXISTS parameters (
     label TEXT PRIMARY KEY, address INTEGER NOT NULL, wire_code TEXT,
-    priority INTEGER NOT NULL DEFAULT 100, min_value REAL, max_value REAL, active INTEGER NOT NULL DEFAULT 1
+    priority INTEGER NOT NULL DEFAULT 100, min_value REAL, max_value REAL, active INTEGER NOT NULL DEFAULT 1,
+    poll_interval INTEGER, publish_interval INTEGER
+);
+CREATE TABLE IF NOT EXISTS publish_state (
+    meter_code TEXT NOT NULL, parameter TEXT NOT NULL, last_published_at TEXT NOT NULL,
+    PRIMARY KEY(meter_code, parameter)
 );
 CREATE TABLE IF NOT EXISTS queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT, meter_code TEXT NOT NULL, parameter TEXT NOT NULL,
@@ -143,7 +151,131 @@ DEFAULT_SETTINGS = {
     "publish_throttle_enabled": "false", "log_skipped_events": "false",
     "connectivity_debounce_enabled": "false", "mqtt_connectivity_min_gap_seconds": "60",
     "connectivity_heartbeat_enabled": "false", "connectivity_heartbeat_hours": "24", "connectivity_heartbeat_check_minutes": "15",
+    "backup_enabled": "true", "backup_retention_days": "0",
 }
+
+# ==================================================================== BACKUP (CSV copy of everything sent to IDMS)
+class BackupWriter:
+    """Keeps a plain CSV copy of every reading / connectivity event handed to
+    IDMS, plus every delivery result (ack), on the gateway's own disk:
+
+        backup/YYYYMM/readings_YYYYMMDD.csv
+        backup/YYYYMM/connectivity_YYYYMMDD.csv
+        backup/YYYYMM/acks_YYYYMMDD.csv
+
+    It is a safety copy that survives history purges, factory resets and a
+    damaged bridge.db. Load on the gateway is negligible: callers only put a
+    tuple on an in-memory queue; one low-priority background thread appends
+    batches of lines. Writing stops (with a warning) when free disk space is
+    low, so a full disk can never take the bridge down."""
+    HEADERS = {
+        "readings":     ["logged_at", "date_time", "meter_code", "parameter", "value", "msg_no", "status"],
+        "connectivity": ["logged_at", "at", "entity_type", "entity_id", "status", "msg_no"],
+        "acks":         ["logged_at", "msg_no", "result", "message"],
+    }
+    MIN_FREE_BYTES = 200 * 1024 * 1024
+
+    def __init__(self, base: Path, enabled_fn):
+        self.base = Path(base)
+        self.enabled_fn = enabled_fn
+        self.batch_delay = 2.0            # seconds to let a burst accumulate into one write
+        self.q = _queue_mod.SimpleQueue()
+        self.lock = threading.Lock()
+        self.thread = None
+        self.pending = 0
+        self._enabled_cache = (0.0, True)
+        self._last_warn = 0.0
+
+    def _enabled(self):
+        ts, val = self._enabled_cache
+        if time.time() - ts > 30:
+            try: val = bool(self.enabled_fn())
+            except Exception: val = True
+            self._enabled_cache = (time.time(), val)
+        return val
+
+    def record(self, kind, *fields):
+        """Never raises and never blocks the caller."""
+        try:
+            if not self._enabled(): return
+            with self.lock:
+                self.pending += 1
+                if self.thread is None or not self.thread.is_alive():
+                    self.thread = threading.Thread(target=self._run, name="backup-writer", daemon=True)
+                    self.thread.start()
+            self.q.put((kind, datetime.now(), list(fields)))
+        except Exception:
+            pass
+
+    def _warn(self, msg, *args):
+        if time.time() - self._last_warn > 60:
+            self._last_warn = time.time()
+            log.warning(msg, *args)
+
+    def _run(self):
+        while True:
+            items = [self.q.get()]
+            if self.batch_delay: time.sleep(self.batch_delay)
+            while len(items) < 1000:
+                try: items.append(self.q.get_nowait())
+                except _queue_mod.Empty: break
+            try:
+                self._write(items)
+            except Exception as e:
+                self._warn("backup write failed: %s", e)
+            finally:
+                with self.lock: self.pending -= len(items)
+
+    def _write(self, items):
+        self.base.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(self.base).free < self.MIN_FREE_BYTES:
+            self._warn("backup paused: less than %d MB free on disk", self.MIN_FREE_BYTES // (1024 * 1024))
+            return
+        by_file = {}
+        for kind, ts, fields in items:
+            d = self.base / ts.strftime("%Y%m")
+            by_file.setdefault((d / f"{kind}_{ts.strftime('%Y%m%d')}.csv", kind), []).append([ts.strftime("%Y-%m-%d %H:%M:%S")] + fields)
+        for (path, kind), rows in by_file.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            new = not path.exists() or path.stat().st_size == 0
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new: w.writerow(self.HEADERS[kind])
+                w.writerows(rows)
+
+    def flush(self, timeout=10.0):
+        """Waits until everything queued so far is on disk (used by tests / shutdown)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            with self.lock:
+                if self.pending <= 0: return True
+            time.sleep(0.02)
+        return False
+
+    def files(self):
+        return sorted(self.base.glob("*/*.csv")) if self.base.exists() else []
+
+    def status(self):
+        fs = self.files()
+        free = shutil.disk_usage(self.base if self.base.exists() else Path(".")).free
+        return {"enabled": self._enabled(), "path": str(self.base.resolve()), "files": len(fs),
+                "size_mb": round(sum(f.stat().st_size for f in fs) / (1024 * 1024), 2),
+                "latest_file": fs[-1].name if fs else None, "free_disk_mb": round(free / (1024 * 1024))}
+
+    def purge(self, days):
+        """Deletes backup files older than `days` (0 = keep forever)."""
+        if days <= 0 or not self.base.exists(): return 0
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+        n = 0
+        for f in self.files():
+            day = f.stem.rsplit("_", 1)[-1]
+            if day.isdigit() and day < cutoff:
+                try: f.unlink(); n += 1
+                except OSError: pass
+        for d in self.base.glob("*"):
+            try: d.rmdir()   # only succeeds when empty
+            except OSError: pass
+        return n
 
 class Store:
     def __init__(self, path: Path):
@@ -183,9 +315,23 @@ class Store:
             self.c.execute("ALTER TABLE zlans ADD COLUMN last_connectivity_sent_at TEXT")
         except sqlite3.OperationalError:
             pass
+        # v1.1: per-parameter poll / publish intervals. Gateways that were set up
+        # before this version get the columns added; MD is then set to the
+        # 30-minute poll + 30-minute publish the site requires (editable on the
+        # Parameters tab afterwards -- this runs only once, when the columns are new).
+        added = []
+        for col in ("poll_interval", "publish_interval"):
+            try:
+                self.c.execute(f"ALTER TABLE parameters ADD COLUMN {col} INTEGER")
+                added.append(col)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        if added:
+            self.c.execute("UPDATE parameters SET poll_interval=30, publish_interval=30 WHERE label='md'")
         for k, v in DEFAULT_SETTINGS.items():
             self.c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         self.c.commit()
+        self.backup = BackupWriter(BACKUP_DIR, lambda: self.get("backup_enabled") != "false")
 
     # -- settings --
     def _q(self, sql, params=()):
@@ -277,6 +423,7 @@ class Store:
             return "New meter code already in use."
         with self.lock:
             self._q("UPDATE meters SET meter_code=? WHERE meter_code=?", (new_code, old_code))
+            self._q("UPDATE publish_state SET meter_code=? WHERE meter_code=?", (new_code, old_code))
             self.c.commit()
         return None
 
@@ -292,22 +439,37 @@ class Store:
             self.c.commit()
         return cur.rowcount > 0
 
-    def check_publish_throttle(self, meter_code):
-        """True = OK to publish now. False = too soon, drop this reading.
-        Falls back meter override -> ZLAN default -> no throttle (every read)."""
-        r = self._q("""SELECT m.publish_interval, m.last_published_at, z.default_publish_interval
-            FROM meters m LEFT JOIN zlans z ON z.zlan_ip = m.zlan_ip WHERE m.meter_code=?""", (meter_code,)).fetchone()
-        if not r: return True
-        meter_interval, last, zlan_default = r
-        interval = meter_interval or zlan_default
-        if not interval or not last: return True
-        last_dt = _parse_ts(last)
-        return (datetime.now() - last_dt).total_seconds() >= interval * 60
+    THROTTLE_TOLERANCE_S = 30   # polls drift by a few seconds; don't lose a whole poll cycle to that
 
-    def mark_published(self, meter_code, dt=None):
+    def publish_interval_for(self, meter_code, label):
+        """Minutes between publishes for one meter+parameter. Most specific wins:
+        parameter -> meter -> ZLAN default -> None (no throttle, every read)."""
+        r = self._q("""SELECT p.publish_interval, m.publish_interval, z.default_publish_interval
+            FROM meters m LEFT JOIN zlans z ON z.zlan_ip = m.zlan_ip
+            LEFT JOIN parameters p ON p.label=?
+            WHERE m.meter_code=?""", (label, meter_code)).fetchone()
+        if not r: return None
+        return r[0] or r[1] or r[2] or None
+
+    def check_publish_throttle(self, meter_code, label):
+        """True = OK to publish this parameter now. False = published too
+        recently, drop this reading. Tracked per meter AND per parameter, so
+        publishing kWh never blocks MD / volt / amp (v1.0 tracked per meter
+        only, which silently dropped everything except the first parameter)."""
+        interval = self.publish_interval_for(meter_code, label)
+        if not interval: return True
+        r = self._q("SELECT last_published_at FROM publish_state WHERE meter_code=? AND parameter=?",
+                    (meter_code, label)).fetchone()
+        if not r: return True
+        elapsed = (datetime.now() - _parse_ts(r[0])).total_seconds()
+        return elapsed >= interval * 60 - self.THROTTLE_TOLERANCE_S
+
+    def mark_published(self, meter_code, label, dt=None):
         dt = dt or datetime.now()
         with self.lock:
-            self._q("UPDATE meters SET last_published_at=? WHERE meter_code=?", (dt.strftime("%Y-%m-%d %H:%M:%S.%f"), meter_code))
+            self._q("INSERT INTO publish_state(meter_code,parameter,last_published_at) VALUES(?,?,?) "
+                    "ON CONFLICT(meter_code,parameter) DO UPDATE SET last_published_at=excluded.last_published_at",
+                    (meter_code, label, dt.strftime("%Y-%m-%d %H:%M:%S.%f")))
             self.c.commit()
 
     def log_skipped(self, meter_code, parameter, value, reason):
@@ -326,6 +488,7 @@ class Store:
             self._q("""INSERT INTO connectivity_history(entity_type,entity_id,status,at,msg_no,delivery_status,created_at)
                 VALUES(?,?,?,?,?,'queued',?)""", (entity_type, entity_id, status, at, msg_no, now_ms()))
             self.c.commit()
+        self.backup.record("connectivity", at, entity_type, entity_id, status, msg_no)
         bus.publish("connectivity", {"entity_type": entity_type, "entity_id": entity_id, "status": status})
         return msg_no, at
 
@@ -359,6 +522,7 @@ class Store:
             self._q("UPDATE connectivity_history SET delivery_status='released', released_at=?, error_message=? WHERE msg_no=?",
                 (now_ms(), message or None, msg_no))
             self.c.commit()
+        self.backup.record("acks", msg_no, "released", message or "")
 
     def conn_fail_attempt(self, msg_no, error=""):
         max_a = int(self.get("max_attempts") or 5)
@@ -370,6 +534,7 @@ class Store:
                 self._q("DELETE FROM connectivity_queue WHERE id=?", (rid,))
                 self._q("UPDATE connectivity_history SET delivery_status='failed', failed_at=?, error_message=? WHERE msg_no=?", (now_ms(), error, msg_no))
                 self.c.commit()
+                self.backup.record("acks", msg_no, "failed", error or "")
                 return "failed"
             self._q("UPDATE connectivity_queue SET awaiting_response=NULL WHERE id=?", (rid,)); self.c.commit()
             return "requeued"
@@ -503,24 +668,35 @@ class Store:
 
     # -- Parameters --
     def list_params(self, active_only=True):
-        q = "SELECT label,address,wire_code,priority,min_value,max_value,active FROM parameters"
+        q = "SELECT label,address,wire_code,priority,min_value,max_value,active,poll_interval,publish_interval FROM parameters"
         if active_only: q += " WHERE active=1"
         q += " ORDER BY priority ASC, label"
         rows = self._q(q).fetchall()
         return [{"label":r[0],"address":r[1],"wire_code":r[2] or r[0],"priority":r[3],
-                  "min_value":r[4],"max_value":r[5],"active":bool(r[6])} for r in rows]
+                  "min_value":r[4],"max_value":r[5],"active":bool(r[6]),
+                  "poll_interval":r[7],"publish_interval":r[8]} for r in rows]
 
-    def add_param(self, label, address, wire_code=None, priority=100, min_value=None, max_value=None):
+    def add_param(self, label, address, wire_code=None, priority=100, min_value=None, max_value=None,
+                  poll_interval=None, publish_interval=None):
         existing = self.list_params(active_only=False)
         if any(p["label"] == label for p in existing): return f"Parameter '{label}' already exists."
         for p in existing:
             if address < p["address"] + 2 and p["address"] < address + 2:
                 return f"Address overlaps with '{p['label']}'."
         with self.lock:
-            self._q("INSERT INTO parameters VALUES(?,?,?,?,?,?,1)",
-                (label, address, wire_code, priority, min_value, max_value))
+            self._q("INSERT INTO parameters(label,address,wire_code,priority,min_value,max_value,active,poll_interval,publish_interval) "
+                    "VALUES(?,?,?,?,?,?,1,?,?)",
+                (label, address, wire_code, priority, min_value, max_value, poll_interval, publish_interval))
             self.c.commit()
         return None
+
+    def update_param_intervals(self, label, poll_interval, publish_interval):
+        """Minutes, or None to fall back (poll: every meter cycle; publish: meter / ZLAN default)."""
+        with self.lock:
+            cur = self._q("UPDATE parameters SET poll_interval=?, publish_interval=? WHERE label=?",
+                          (poll_interval, publish_interval, label))
+            self.c.commit()
+        return cur.rowcount > 0
 
     def delete_param(self, label):
         with self.lock:
@@ -558,6 +734,7 @@ class Store:
         return self._q("SELECT COUNT(*) FROM queue").fetchone()[0]
 
     def enqueue(self, meter_code, parameter, value, msg_no=None, dt=None, awaiting=False):
+        dropped_msg = None
         dt = dt or datetime.now()
         msg_no = msg_no or self.next_msg_no(meter_code, parameter, dt)
         date_time = dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -572,11 +749,14 @@ class Store:
                     self._q("INSERT INTO dropped_log(meter_code,parameter,value,msg_no,at) VALUES(?,?,?,?,?)",
                         (oldest[1], oldest[2], oldest[3], oldest[4], now_s()))
                     self._q("UPDATE history SET status='dropped' WHERE msg_no=?", (oldest[4],))
+                    dropped_msg = oldest[4]
             self._q("INSERT INTO queue(meter_code,parameter,value,date_time,msg_no,created_at,awaiting_response) VALUES(?,?,?,?,?,?,?)",
                 (meter_code, parameter, value, date_time, msg_no, created, created if awaiting else None))
             self._q("INSERT INTO history(meter_code,parameter,value,date_time,msg_no,status,created_at) VALUES(?,?,?,?,?,'queued',?)",
                 (meter_code, parameter, value, date_time, msg_no, created))
             self.c.commit()
+        if dropped_msg: self.backup.record("acks", dropped_msg, "dropped", "queue full (max_queue_size)")
+        self.backup.record("readings", date_time, meter_code, parameter, value, msg_no, "queued")
         return msg_no
 
     def log_direct_release(self, meter_code, parameter, value, msg_no=None, dt=None):
@@ -588,6 +768,7 @@ class Store:
             self._q("INSERT INTO history(meter_code,parameter,value,date_time,msg_no,status,created_at,released_at) VALUES(?,?,?,?,?,'released',?,?)",
                 (meter_code, parameter, value, date_time, msg_no, ts, ts))
             self.c.commit()
+        self.backup.record("readings", date_time, meter_code, parameter, value, msg_no, "released")
         return msg_no
 
     def oldest_queued(self, skip_awaiting=True):
@@ -621,6 +802,7 @@ class Store:
             self._q("UPDATE history SET status='released', released_at=?, error_message=? WHERE msg_no=?",
                             (now_ms(), message or None, msg_no))
             self.c.commit()
+        self.backup.record("acks", msg_no, "released", message or "")
 
     def fail_attempt(self, msg_no, error=""):
         max_a = int(self.get("max_attempts") or 5)
@@ -632,6 +814,7 @@ class Store:
                 self._q("DELETE FROM queue WHERE id=?", (rid,))
                 self._q("UPDATE history SET status='failed', failed_at=?, error_message=? WHERE msg_no=?", (now_ms(), error, msg_no))
                 self.c.commit()
+                self.backup.record("acks", msg_no, "failed", error or "")
                 return "failed"
             self._q("UPDATE queue SET awaiting_response=NULL WHERE id=?", (rid,)); self.c.commit()
             return "requeued"
@@ -724,6 +907,8 @@ class Store:
                 self._q("UPDATE history SET status='failed', failed_at=?, error_message=? WHERE msg_no=?",
                     (now_ms(), f"Purged: exceeded queue retention ({days} days)", msg_no))
             self.c.commit()
+        for (msg_no,) in rows:
+            self.backup.record("acks", msg_no, "failed", f"Purged: exceeded queue retention ({days} days)")
         return len(rows)
 
     def purge_expired_connectivity(self):
@@ -752,9 +937,11 @@ class Store:
                     VALUES(?,?,?,?,?,?)""", (m["meter_code"], m["zlan_ip"], m["unit_id"], m.get("polling_interval"),
                     1 if m.get("active",True) else 0, m.get("registered_at", now_s())))
             for p in data.get("parameters", []):
-                self._q("INSERT OR REPLACE INTO parameters VALUES(?,?,?,?,?,?,?)",
+                self._q("INSERT OR REPLACE INTO parameters(label,address,wire_code,priority,min_value,max_value,active,poll_interval,publish_interval) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
                     (p["label"], p["address"], p.get("wire_code"), p.get("priority",100),
-                     p.get("min_value"), p.get("max_value"), 1 if p.get("active",True) else 0))
+                     p.get("min_value"), p.get("max_value"), 1 if p.get("active",True) else 0,
+                     p.get("poll_interval"), p.get("publish_interval")))
             for k, v in data.get("settings", {}).items():
                 self._q("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, v))
             self.c.commit()
@@ -774,7 +961,7 @@ class Store:
         show the initial 'set up password' screen again after restart."""
         with self.lock:
             for t in ["zlans", "meters", "parameters", "queue", "history", "invalid_log",
-                      "dropped_log", "msg_counters", "connectivity_history", "connectivity_queue", "skipped_log"]:
+                      "dropped_log", "msg_counters", "connectivity_history", "connectivity_queue", "skipped_log", "publish_state"]:
                 self._q(f"DELETE FROM {t}")
             self._q("DELETE FROM settings")
             for k, v in DEFAULT_SETTINGS.items():
@@ -1003,19 +1190,38 @@ outbound = Outbound()
 # meter's own polling_interval. Different ZLANs poll independently/parallel.
 
 _next_due: Dict[str, datetime] = {}   # meter_code -> next scheduled poll time
+_param_due: Dict[tuple, datetime] = {}  # (meter_code, label) -> next time that parameter should be read
+
+def due_params(meter_code, params, now=None):
+    """Parameters to read in this poll cycle of a meter. A parameter with its
+    own poll_interval (minutes) is read only when that has elapsed since its
+    last successful read; one without is read every cycle. The interval acts
+    in steps of the meter's own poll cycle (e.g. MD 30 min on a 15-min meter
+    -> every second cycle)."""
+    now = now or datetime.now()
+    out = []
+    for p in params:
+        if not p.get("poll_interval"):
+            out.append(p); continue
+        due = _param_due.get((meter_code, p["label"]))
+        if due is None or now >= due:
+            out.append(p)
+    return out
 _zlan_threads: Dict[str, threading.Thread] = {}
 
 def handle_reading(meter_code, label, value):
     """A validated reading is ready to send -- direct-send-first,
     fall back to queue/pending on failure (Sec 4). If publish throttling
-    is enabled, readings faster than the meter's publish_interval are
-    dropped (optionally logged) without touching the send pipeline."""
+    is enabled, a reading is dropped (optionally logged) when the same
+    meter+parameter was published less than its publish interval ago --
+    interval = parameter, else meter, else ZLAN default. Every reading that
+    IS published is stored in history and in the CSV backup."""
     if not store.validate_range(label, value):
         store.log_invalid(meter_code, label, value, "out of configured range")
         bus.publish("invalid", {"meter_code": meter_code, "parameter": label, "value": value})
         return
     cfg = store.settings_dict()
-    if cfg.get("publish_throttle_enabled") == "true" and not store.check_publish_throttle(meter_code):
+    if cfg.get("publish_throttle_enabled") == "true" and not store.check_publish_throttle(meter_code, label):
         if cfg.get("log_skipped_events") == "true":
             store.log_skipped(meter_code, label, value, "publish interval not elapsed")
         bus.publish("skipped", {"meter_code": meter_code, "parameter": label, "value": value})
@@ -1025,7 +1231,7 @@ def handle_reading(meter_code, label, value):
     date_time = now.strftime("%Y-%m-%d %H:%M:%S")
     bus.publish("reading", {"meter_code": meter_code, "parameter": label, "value": value})
     if cfg.get("publish_throttle_enabled") == "true":
-        store.mark_published(meter_code, now)
+        store.mark_published(meter_code, label, now)
     result = outbound.send(meter_code, label, value, msg_no, date_time)
     if result == "confirmed":
         store.log_direct_release(meter_code, label, value, msg_no=msg_no, dt=now)
@@ -1080,7 +1286,6 @@ def poll_zlan_forever(zlan_ip):
         zlan = zlans[zlan_ip]
         meters = [m for m in store.list_meters(zlan_ip=zlan_ip, active_only=True)]
         params = store.list_params(active_only=True)
-        groups = group_addresses([{"label": p["label"], "address": p["address"], "count": 2} for p in params])
 
         if client is None:
             client = ModbusTcpClient(zlan_ip, port=zlan["port"], timeout=float(store.get("modbus_timeout") or 4.5))
@@ -1121,6 +1326,14 @@ def poll_zlan_forever(zlan_ip):
                 store.mark_meter_result(m["meter_code"], False)
                 _next_due[m["meter_code"]] = datetime.now() + timedelta(minutes=interval)
                 continue
+            m_params = due_params(m["meter_code"], params)
+            if not m_params:
+                # nothing due for this meter in this cycle (e.g. only MD, which is
+                # polled less often) -- no Modbus traffic, no status change
+                _next_due[m["meter_code"]] = datetime.now() + timedelta(minutes=interval)
+                continue
+            groups = group_addresses([{"label": p["label"], "address": p["address"], "count": 2} for p in m_params])
+            poll_minutes = {p["label"]: p.get("poll_interval") for p in m_params}
             meter_ok = True
             transport_failure = False
             for g in groups:
@@ -1140,6 +1353,8 @@ def poll_zlan_forever(zlan_ip):
                     for mem in g["members"]:
                         hi, lo = regs[mem["offset"]], regs[mem["offset"] + 1]
                         value = round(decode_f32(hi, lo), 2)
+                        if poll_minutes.get(mem["label"]):
+                            _param_due[(m["meter_code"], mem["label"])] = datetime.now() + timedelta(minutes=poll_minutes[mem["label"]])
                         handle_reading(m["meter_code"], mem["label"], value)
                 except Exception:
                     # A genuine transport-level failure (timeout, connection
@@ -1220,9 +1435,13 @@ def retry_loop():
 
 def retention_loop():
     while True:
-        store.purge_stale_queue()
-        store.purge_expired()
-        store.purge_expired_connectivity()
+        try:
+            store.purge_stale_queue()
+            store.purge_expired()
+            store.purge_expired_connectivity()
+            store.backup.purge(int(store.get("backup_retention_days") or 0))
+        except Exception:
+            log.exception("retention cycle failed")  # never let a purge error kill the thread
         time.sleep(3600)
 
 def heartbeat_check_once():
@@ -1494,12 +1713,35 @@ def api_zlan_publish_interval(zlan_ip: str, payload: dict = Body(...)):
 @app.get("/api/parameters")
 def api_params(): return store.list_params(active_only=False)
 
+def _minutes_or_none(v, name):
+    """'' / None -> None (use the fallback); otherwise a whole number of minutes >= 1."""
+    if v in (None, ""): return None, None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None, f"{name} must be a whole number of minutes."
+    if n < 1: return None, f"{name} must be at least 1 minute."
+    if n > 525600: return None, f"{name} must be at most 525600 minutes (one year)."
+    return n, None
+
 @app.post("/api/parameters")
 def api_add_param(payload: dict = Body(...)):
+    poll, e1 = _minutes_or_none(payload.get("poll_interval"), "Poll interval")
+    pub, e2 = _minutes_or_none(payload.get("publish_interval"), "Publish interval")
+    if e1 or e2: return bad(e1 or e2)
     err = store.add_param(payload["label"], int(payload["address"]), payload.get("wire_code"),
-        int(payload.get("priority", 100)), payload.get("min_value"), payload.get("max_value"))
+        int(payload.get("priority", 100)), payload.get("min_value"), payload.get("max_value"),
+        poll_interval=poll, publish_interval=pub)
     if err: return bad(err)
     return {"added": payload["label"]}
+
+@app.put("/api/parameters/{label}/intervals")
+def api_param_intervals(label: str, payload: dict = Body(...)):
+    poll, e1 = _minutes_or_none(payload.get("poll_interval"), "Poll interval")
+    pub, e2 = _minutes_or_none(payload.get("publish_interval"), "Publish interval")
+    if e1 or e2: return bad(e1 or e2)
+    if not store.update_param_intervals(label, poll, pub): return bad("Not found.", 404)
+    return {"label": label, "poll_interval": poll, "publish_interval": pub}
 
 @app.delete("/api/parameters/{label}")
 def api_del_param(label: str):
@@ -1595,7 +1837,8 @@ def api_dashboard():
             "zlans_connected": sum(1 for v in zlan_status.values() if v["connected"] == v["total"] and v["total"] > 0),
             "meters_total": len(meters), "meters_connected": meters_connected,
             "per_zlan": zlan_status, "max_queue_size": int(store.get("max_queue_size") or 5000),
-            "db_size_mb": db_size_mb, "broker_connected": outbound.last_connected}
+            "db_size_mb": db_size_mb, "broker_connected": outbound.last_connected,
+            "version": APP_VERSION}
 
 # -- CSV export (Sec 4.2) --
 def _csv_response(headers, rows, filename):
@@ -1638,6 +1881,12 @@ def api_set_settings(payload: dict = Body(...)):
         if k in DEFAULT_SETTINGS and k not in ("auth_hash","auth_salt"):
             store.set(k, v)
     return {"ok": True}
+
+@app.get("/api/version")
+def api_version(): return {"version": APP_VERSION}
+
+@app.get("/api/backup/status")
+def api_backup_status(): return store.backup.status()
 
 @app.get("/api/config/export")
 def config_export(): return store.export_config()

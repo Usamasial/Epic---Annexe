@@ -1,0 +1,14 @@
+# Per-gateway data -- never committed, never overwritten by an update
+bridge.db
+bridge.db-shm
+bridge.db-wal
+*.db
+backup/
+db-backups/
+code-backups/
+.deploy_branch
+.env
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/

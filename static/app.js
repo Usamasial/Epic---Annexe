@@ -49,6 +49,7 @@ function pager(id, loadFn) {
 // -- dashboard --
 async function loadDashboard() {
   const d = await (await fetch("/api/dashboard")).json();
+  if (d.version) document.getElementById("app-version").textContent = "v" + d.version;
   document.getElementById("kpi-zlans").textContent = `${d.zlans_connected}/${d.zlans_total}`;
   document.getElementById("kpi-meters").textContent = `${d.meters_connected}/${d.meters_total}`;
   document.getElementById("kpi-queued").textContent = d.queued;
@@ -186,14 +187,26 @@ async function saveMeterPublishInterval(code){
 // -- Parameters --
 async function loadParams() {
   const ps = await (await fetch("/api/parameters")).json();
-  document.getElementById("param-rows").innerHTML = ps.length===0 ? '<tr><td colspan="7">None yet.</td></tr>' :
+  document.getElementById("param-rows").innerHTML = ps.length===0 ? '<tr><td colspan="9">None yet.</td></tr>' :
     ps.map(p=>`<tr><td>${p.label}</td><td>${p.address}</td><td>${p.wire_code}</td><td>${p.priority}</td><td>${p.min_value??'-'}</td><td>${p.max_value??'-'}</td>
+      <td><input type="number" min="1" class="interval-input" id="param-poll-${p.label}" value="${p.poll_interval||''}" placeholder="(each cycle)" style="width:115px"></td>
+      <td><input type="number" min="1" class="interval-input" id="param-pub-${p.label}" value="${p.publish_interval||''}" placeholder="(meter/ZLAN)" style="width:115px">
+        <button class="btn-ghost" onclick="saveParamIntervals('${p.label}')">Save</button></td>
       <td><button class="btn-delete" onclick="delParam('${p.label}')">Remove</button></td></tr>`).join("");
+}
+async function saveParamIntervals(label){
+  const poll = document.getElementById("param-poll-"+label).value, pub = document.getElementById("param-pub-"+label).value;
+  const r = await fetch("/api/parameters/"+encodeURIComponent(label)+"/intervals",{method:"PUT",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({poll_interval: poll===""?null:Number(poll), publish_interval: pub===""?null:Number(pub)})});
+  const msg=document.getElementById("param-msg");
+  if(!r.ok){const d=await r.json(); msg.textContent=d.detail; msg.className="msg error"; return;}
+  msg.textContent="Saved "+label+" intervals."; msg.className="msg success"; await loadParams();
 }
 document.getElementById("btn-add-param").addEventListener("click", async () => {
   const body = {label:document.getElementById("new-param-label").value, address:Number(document.getElementById("new-param-address").value),
     wire_code:document.getElementById("new-param-wire").value, priority:Number(document.getElementById("new-param-priority").value),
-    min_value: document.getElementById("new-param-min").value || null, max_value: document.getElementById("new-param-max").value || null};
+    min_value: document.getElementById("new-param-min").value || null, max_value: document.getElementById("new-param-max").value || null,
+    poll_interval: document.getElementById("new-param-poll").value || null, publish_interval: document.getElementById("new-param-publish").value || null};
   const r = await fetch("/api/parameters",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json(); const msg=document.getElementById("param-msg");
   if(!r.ok){msg.textContent=d.detail;msg.className="msg error";return;}
@@ -419,6 +432,9 @@ async function loadOutput() {
   document.getElementById("set-heartbeat-enabled").checked = s.connectivity_heartbeat_enabled==="true";
   document.getElementById("set-heartbeat-hours").value = s.connectivity_heartbeat_hours;
   document.getElementById("set-heartbeat-check-minutes").value = s.connectivity_heartbeat_check_minutes;
+  document.getElementById("set-backup-enabled").checked = s.backup_enabled!=="false";
+  document.getElementById("set-backup-retention").value = s.backup_retention_days;
+  loadBackupStatus();
   toggleConnFields();
 }
 document.getElementById("btn-save-output").addEventListener("click", async () => {
@@ -447,6 +463,19 @@ document.getElementById("btn-save-modbus-tuning").addEventListener("click", asyn
     modbus_inter_request_delay: document.getElementById("set-inter-delay").value};
   await fetch("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const msg=document.getElementById("modbus-tuning-msg"); msg.textContent="Saved. Restart the app to apply to running ZLANs."; msg.className="msg success";
+});
+async function loadBackupStatus(){
+  try {
+    const b = await (await fetch("/api/backup/status")).json();
+    document.getElementById("backup-status").textContent = (b.enabled ? "Backup is ON. " : "Backup is OFF. ") +
+      `${b.files} file(s), ${b.size_mb} MB, latest: ${b.latest_file||"none yet"}. Folder: ${b.path}. Free disk: ${b.free_disk_mb} MB.`;
+  } catch(e) { document.getElementById("backup-status").textContent = "Backup status unavailable."; }
+}
+document.getElementById("btn-save-backup").addEventListener("click", async () => {
+  const body = {backup_enabled: document.getElementById("set-backup-enabled").checked?"true":"false",
+    backup_retention_days: document.getElementById("set-backup-retention").value || "0"};
+  await fetch("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const msg=document.getElementById("backup-msg"); msg.textContent="Saved."; msg.className="msg success"; loadBackupStatus();
 });
 document.getElementById("btn-save-throttle").addEventListener("click", async () => {
   const body = {publish_throttle_enabled: document.getElementById("set-publish-throttle-enabled").checked?"true":"false",

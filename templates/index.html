@@ -25,7 +25,7 @@
 
 <div id="app" class="frame" style="display:none;">
   <header class="topbar">
-    <div class="brand"><div class="brand-mark"></div><div><h1>Modbus Bridge</h1></div></div>
+    <div class="brand"><div class="brand-mark"></div><div><h1>Modbus Bridge</h1><span class="msg" id="app-version" title="Application version"></span></div></div>
     <div class="topbar-status">
       <div class="status-chip" id="chip-system"><span class="dot"></span><span id="system-state">&hellip;</span></div>
       <div class="status-chip" id="chip-broker"><span class="dot"></span><span id="broker-state">&hellip;</span></div>
@@ -103,10 +103,13 @@
           <label>Priority<input type="number" id="new-param-priority" value="100"></label>
           <label>Min value<input type="number" id="new-param-min" step="any"></label>
           <label>Max value<input type="number" id="new-param-max" step="any"></label>
+          <label>Poll (min)<input type="number" id="new-param-poll" min="1" placeholder="(every cycle)"></label>
+          <label>Publish (min)<input type="number" id="new-param-publish" min="1" placeholder="(meter / ZLAN)"></label>
           <button class="btn-primary" id="btn-add-param">Add</button>
         </div>
         <p class="msg" id="param-msg"></p>
-        <div class="table-wrap"><table><thead><tr><th>Label</th><th>Address</th><th>Wire</th><th>Priority</th><th>Min</th><th>Max</th><th></th></tr></thead><tbody id="param-rows"></tbody></table></div>
+        <p class="msg">Poll = how often this parameter is read from the meter (blank = every meter poll cycle; applied in steps of the meter's own poll interval, e.g. 30 on a 15-minute meter = every second cycle). Publish = minimum minutes between sends of this parameter to IDMS when publish throttling is on (blank = the meter's, then the ZLAN's, publish interval).</p>
+        <div class="table-wrap"><table><thead><tr><th>Label</th><th>Address</th><th>Wire</th><th>Priority</th><th>Min</th><th>Max</th><th>Poll (min)</th><th>Publish (min)</th><th></th></tr></thead><tbody id="param-rows"></tbody></table></div>
       </section>
     </section>
 
@@ -250,8 +253,18 @@
         <div class="card-head"><h2>Publish throttle (reading rate vs. publish rate)</h2></div>
         <label class="switch-row"><input type="checkbox" id="set-publish-throttle-enabled"><span class="slider"></span><span>Enable publish throttling</span></label>
         <label class="switch-row"><input type="checkbox" id="set-log-skipped-events"><span class="slider"></span><span>Log skipped/dropped readings</span></label>
-        <p class="msg">Set each meter's "Publish (min)" interval in the ZLANs &amp; Meters tab. When enabled, readings faster than that interval are dropped.</p>
+        <p class="msg">When enabled, a parameter is published at most once per its publish interval, tracked separately for every meter and parameter (so kWh never blocks MD, volt or amp). The interval is taken from the parameter (Parameters tab), else the meter, else the ZLAN default (ZLANs &amp; Meters tab). Readings that come sooner are dropped.</p>
         <div class="card-actions"><button class="btn-primary" id="btn-save-throttle">Save</button><span class="msg" id="throttle-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Backup (CSV files on this gateway)</h2></div>
+        <label class="switch-row"><input type="checkbox" id="set-backup-enabled"><span class="slider"></span><span>Keep a CSV copy of everything sent to IDMS</span></label>
+        <div class="add-form">
+          <label>Backup retention (days, 0=forever)<input type="number" id="set-backup-retention"></label>
+        </div>
+        <p class="msg" id="backup-status">&hellip;</p>
+        <p class="msg">Readings, connectivity events and delivery results are appended to daily files under the backup folder (one folder per month). They survive history purges and database resets. Writing pauses automatically if free disk space gets low.</p>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-backup">Save</button><span class="msg" id="backup-msg"></span></div>
       </section>
       <section class="card">
         <div class="card-head"><h2>Connectivity debounce</h2></div>

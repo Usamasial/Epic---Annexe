@@ -114,17 +114,81 @@ document.getElementById("btn-bulk-upload").addEventListener("click", async () =>
   await loadZlans(); await loadMeters();
 });
 
+// -- UI helpers --------------------------------------------------------------
+// 1) Tables that refresh themselves (ZLANs, Meters, Parameters) must never wipe what the
+//    user is typing: values typed but not saved yet, and the cursor, survive a re-render.
+// 2) Every Save shows "Saved" / "Not saved" right next to its button.
+function renderRows(tbodyId, html) {
+  const tbody = document.getElementById(tbodyId);
+  const dirty = {};
+  tbody.querySelectorAll("input").forEach(i => { if (i.id && i.value !== i.defaultValue) dirty[i.id] = i.value; });
+  const a = document.activeElement;
+  const focusId = (a && a.id && tbody.contains(a)) ? a.id : null;
+  const caret = focusId && a.selectionStart != null ? a.selectionStart : null;
+  tbody.innerHTML = html;
+  tbody.querySelectorAll("input").forEach(i => {
+    if (i.id in dirty) i.value = dirty[i.id];
+    i.classList.toggle("dirty", i.value !== i.defaultValue);
+  });
+  if (focusId) {
+    const f = document.getElementById(focusId);
+    if (f) { f.focus(); try { if (caret != null) f.setSelectionRange(caret, caret); } catch (e) {} }
+  }
+  applyFlags();
+}
+document.addEventListener("input", e => {
+  const i = e.target;
+  if (i && i.classList && i.classList.contains("interval-input")) i.classList.toggle("dirty", i.value !== i.defaultValue);
+});
+const _flags = {};   // input id -> {ok, text, until}
+function flashSaved(inputId, ok, text) {
+  _flags[inputId] = { ok, text: text || (ok ? "\u2713 Saved" : "\u2717 Not saved"), until: Date.now() + (ok ? 3000 : 6000) };
+  applyFlags();
+  setTimeout(applyFlags, ok ? 3100 : 6100);
+}
+function applyFlags() {
+  Object.keys(_flags).forEach(id => {
+    const f = _flags[id], el = document.getElementById(id);
+    if (!el) return;
+    const btn = el.nextElementSibling;
+    if (!btn) return;
+    let span = btn.nextElementSibling && btn.nextElementSibling.classList.contains("save-flag") ? btn.nextElementSibling : null;
+    if (Date.now() > f.until) { if (span) span.remove(); delete _flags[id]; return; }
+    if (!span) { span = document.createElement("span"); btn.after(span); }
+    span.className = "save-flag " + (f.ok ? "ok" : "bad");
+    span.textContent = f.text;
+  });
+}
+async function putJson(url, body) {
+  try {
+    const r = await fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (r.ok) return { ok: true };
+    let msg = "HTTP " + r.status;
+    try { const d = await r.json(); if (d && typeof d.detail === "string") msg = d.detail; } catch (e) {}
+    return { ok: false, msg };
+  } catch (e) { return { ok: false, msg: "Network error" }; }
+}
+// Save one interval input: validate, PUT, reload the table, show the result next to the button.
+async function saveInterval(inputId, url, key, { required, reload }) {
+  const raw = document.getElementById(inputId).value.trim();
+  if (raw === "" && required) { flashSaved(inputId, false, "\u2717 Enter minutes (1 or more)"); return; }
+  const r = await putJson(url, { [key]: raw === "" ? null : Number(raw) });
+  if (!r.ok) { flashSaved(inputId, false, "\u2717 " + r.msg); return; }
+  await reload();
+  flashSaved(inputId, true);
+}
+
 // -- ZLANs --
 async function loadZlans() {
   const zlans = await (await fetch("/api/zlans")).json();
-  document.getElementById("zlan-rows").innerHTML = zlans.length===0 ? '<tr><td colspan="6">None yet.</td></tr>' :
+  renderRows("zlan-rows", zlans.length===0 ? '<tr><td colspan="6">None yet.</td></tr>' :
     zlans.map(z=>`<tr><td>${z.zlan_ip}</td><td>${z.zlan_label}</td>
       <td><input type="number" class="interval-input" id="zlan-int-${z.zlan_ip}" value="${z.default_polling_interval}" style="width:70px">
         <button class="btn-ghost" onclick="saveZlanInterval('${z.zlan_ip}')">Save</button></td>
       <td><input type="number" class="interval-input" id="zlan-pub-${z.zlan_ip}" value="${z.default_publish_interval||''}" placeholder="(every read)" style="width:70px">
         <button class="btn-ghost" onclick="saveZlanPublishInterval('${z.zlan_ip}')">Save</button></td>
       <td>${z.port}</td>
-      <td><button class="btn-delete" onclick="delZlan('${z.zlan_ip}')">Remove</button></td></tr>`).join("");
+      <td><button class="btn-delete" onclick="delZlan('${z.zlan_ip}')">Remove</button></td></tr>`).join(""));
   const sel = document.getElementById("new-meter-zlan");
   sel.innerHTML = zlans.map(z=>`<option value="${z.zlan_ip}">${z.zlan_label} (${z.zlan_ip})</option>`).join("");
   const connSel = document.getElementById("conn-zlan-filter");
@@ -138,14 +202,10 @@ async function loadZlans() {
   }
 }
 async function saveZlanInterval(zlan_ip){
-  const minutes = Number(document.getElementById(`zlan-int-${zlan_ip}`).value);
-  await fetch(`/api/zlans/${encodeURIComponent(zlan_ip)}/interval`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({default_polling_interval:minutes})});
-  await loadZlans();
+  await saveInterval(`zlan-int-${zlan_ip}`, `/api/zlans/${encodeURIComponent(zlan_ip)}/interval`, "default_polling_interval", {required:true, reload:loadZlans});
 }
 async function saveZlanPublishInterval(zlan_ip){
-  const v = document.getElementById(`zlan-pub-${zlan_ip}`).value;
-  await fetch(`/api/zlans/${encodeURIComponent(zlan_ip)}/publish-interval`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({default_publish_interval:v===""?null:Number(v)})});
-  await loadZlans();
+  await saveInterval(`zlan-pub-${zlan_ip}`, `/api/zlans/${encodeURIComponent(zlan_ip)}/publish-interval`, "default_publish_interval", {required:false, reload:loadZlans});
 }
 document.getElementById("btn-add-zlan").addEventListener("click", async () => {
   const body = {zlan_ip: document.getElementById("new-zlan-ip").value, zlan_label: document.getElementById("new-zlan-label").value,
@@ -162,45 +222,44 @@ async function loadMeters() {
   const search = document.getElementById("meter-search").value;
   const meters = await (await fetch("/api/meters")).json();
   const filtered = search ? meters.filter(m=>m.meter_code.toLowerCase().includes(search.toLowerCase())) : meters;
-  document.getElementById("meter-rows").innerHTML = filtered.length===0 ? '<tr><td colspan="8">None yet.</td></tr>' :
+  renderRows("meter-rows", filtered.length===0 ? '<tr><td colspan="8">None yet.</td></tr>' :
     filtered.map(m=>`<tr><td>${m.meter_code}</td><td>${m.zlan_ip}</td><td>${m.unit_id}</td>
       <td><input type="number" class="interval-input" id="meter-int-${m.meter_code}" value="${m.polling_interval||''}" placeholder="(default)" style="width:70px">
         <button class="btn-ghost" onclick="saveMeterInterval('${m.meter_code}')">Save</button></td>
       <td><input type="number" class="interval-input" id="meter-pub-${m.meter_code}" value="${m.publish_interval||''}" placeholder="(zlan default)" style="width:70px">
         <button class="btn-ghost" onclick="saveMeterPublishInterval('${m.meter_code}')">Save</button></td>
       <td><span class="pill ${m.last_status==='ok'?'released':(m.last_status==='fail'?'failed':'queued')}">${m.active?m.last_status:'inactive'}</span></td>
-      <td>${m.last_poll_at||"-"}</td><td><button class="btn-delete" onclick="toggleMeter('${m.meter_code}',${!m.active})">${m.active?'Deactivate':'Activate'}</button></td></tr>`).join("");
+      <td>${m.last_poll_at||"-"}</td><td><button class="btn-delete" onclick="toggleMeter('${m.meter_code}',${!m.active})">${m.active?'Deactivate':'Activate'}</button></td></tr>`).join(""));
 }
 document.getElementById("meter-search").addEventListener("input", loadMeters);
 async function toggleMeter(code,active){ await fetch(`/api/meters/${encodeURIComponent(code)}/active`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({active})}); await loadMeters(); }
 async function saveMeterInterval(code){
-  const v = document.getElementById(`meter-int-${code}`).value;
-  await fetch(`/api/meters/${encodeURIComponent(code)}/interval`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({polling_interval:v===""?null:Number(v)})});
-  await loadMeters();
+  await saveInterval(`meter-int-${code}`, `/api/meters/${encodeURIComponent(code)}/interval`, "polling_interval", {required:false, reload:loadMeters});
 }
 async function saveMeterPublishInterval(code){
-  const v = document.getElementById(`meter-pub-${code}`).value;
-  await fetch(`/api/meters/${encodeURIComponent(code)}/publish-interval`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({publish_interval:v===""?null:Number(v)})});
-  await loadMeters();
+  await saveInterval(`meter-pub-${code}`, `/api/meters/${encodeURIComponent(code)}/publish-interval`, "publish_interval", {required:false, reload:loadMeters});
 }
 
 // -- Parameters --
 async function loadParams() {
   const ps = await (await fetch("/api/parameters")).json();
-  document.getElementById("param-rows").innerHTML = ps.length===0 ? '<tr><td colspan="9">None yet.</td></tr>' :
+  renderRows("param-rows", ps.length===0 ? '<tr><td colspan="9">None yet.</td></tr>' :
     ps.map(p=>`<tr><td>${p.label}</td><td>${p.address}</td><td>${p.wire_code}</td><td>${p.priority}</td><td>${p.min_value??'-'}</td><td>${p.max_value??'-'}</td>
       <td><input type="number" min="1" class="interval-input" id="param-poll-${p.label}" value="${p.poll_interval||''}" placeholder="(each cycle)" style="width:115px"></td>
       <td><input type="number" min="1" class="interval-input" id="param-pub-${p.label}" value="${p.publish_interval||''}" placeholder="(meter/ZLAN)" style="width:115px">
         <button class="btn-ghost" onclick="saveParamIntervals('${p.label}')">Save</button></td>
-      <td><button class="btn-delete" onclick="delParam('${p.label}')">Remove</button></td></tr>`).join("");
+      <td><button class="btn-delete" onclick="delParam('${p.label}')">Remove</button></td></tr>`).join(""));
 }
 async function saveParamIntervals(label){
-  const poll = document.getElementById("param-poll-"+label).value, pub = document.getElementById("param-pub-"+label).value;
-  const r = await fetch("/api/parameters/"+encodeURIComponent(label)+"/intervals",{method:"PUT",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({poll_interval: poll===""?null:Number(poll), publish_interval: pub===""?null:Number(pub)})});
-  const msg=document.getElementById("param-msg");
-  if(!r.ok){const d=await r.json(); msg.textContent=d.detail; msg.className="msg error"; return;}
-  msg.textContent="Saved "+label+" intervals."; msg.className="msg success"; await loadParams();
+  const pollId = "param-poll-"+label, pubId = "param-pub-"+label;
+  const val = id => document.getElementById(id).value.trim();
+  const msg = document.getElementById("param-msg");
+  const r = await putJson("/api/parameters/"+encodeURIComponent(label)+"/intervals",
+    { poll_interval: val(pollId)==="" ? null : Number(val(pollId)), publish_interval: val(pubId)==="" ? null : Number(val(pubId)) });
+  if (!r.ok) { msg.textContent = r.msg; msg.className = "msg error"; flashSaved(pubId, false, "\u2717 "+r.msg); return; }
+  msg.textContent = "Saved "+label+" intervals."; msg.className = "msg success";
+  await loadParams();
+  flashSaved(pubId, true);
 }
 document.getElementById("btn-add-param").addEventListener("click", async () => {
   const body = {label:document.getElementById("new-param-label").value, address:Number(document.getElementById("new-param-address").value),

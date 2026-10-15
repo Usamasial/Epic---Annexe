@@ -89,3 +89,25 @@ def test_index_page_has_the_new_controls(client):
         assert f'id="{el}"' in html, el
     js = client.get("/static/app.js").text
     assert "saveParamIntervals" in js and "/api/backup/status" in js
+
+
+# ---- ZLAN / meter interval endpoints: same validation as the parameter ones -------------------
+@pytest.mark.parametrize("url,key", [
+    ("/api/zlans/192.168.50.155/interval", "default_polling_interval"),
+    ("/api/zlans/192.168.50.155/publish-interval", "default_publish_interval"),
+    ("/api/meters/M090/interval", "polling_interval"),
+    ("/api/meters/M090/publish-interval", "publish_interval"),
+])
+def test_zlan_and_meter_intervals_are_validated(client, url, key):
+    assert client.put(url, json={key: 30}).status_code == 200
+    for bad in (0, -1, "abc", 10**12):
+        assert client.put(url, json={key: bad}).status_code == 400, (url, bad)
+
+
+def test_blank_zlan_poll_interval_is_rejected_but_publish_blank_clears_it(client, site):
+    # a blank/0 poll interval used to be stored and made the poller spin without any delay
+    assert client.put("/api/zlans/192.168.50.155/interval", json={"default_polling_interval": None}).status_code == 400
+    assert site.store.list_zlans()[0]["default_polling_interval"] == 15
+    assert client.put("/api/zlans/192.168.50.155/publish-interval", json={"default_publish_interval": ""}).status_code == 200
+    assert site.store.list_zlans()[0]["default_publish_interval"] is None
+    assert client.put("/api/meters/M090/interval", json={"polling_interval": None}).status_code == 200

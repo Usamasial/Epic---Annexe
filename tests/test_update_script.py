@@ -1,5 +1,6 @@
 """deploy/update.sh against a local 'origin' repository and a fake gateway directory."""
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -11,6 +12,8 @@ from conftest import REPO
 
 SCRIPT = REPO / "deploy" / "update.sh"
 OLD_APP = 'APP_VERSION = "1.0.0"\nprint("old app")\n'
+CUR = re.search(r'APP_VERSION = "([^"]+)"', (REPO / "app.py").read_text()).group(1)     # version being released
+NEXT = CUR + ".1"
 
 
 def run(cmd, cwd=None, env=None, check=True):
@@ -79,8 +82,8 @@ def env(tmp_path):
 
 def test_first_run_turns_the_gateway_into_a_git_checkout_and_keeps_data(env):
     r = env.update("main")
-    assert "OK: version 1.1.0" in r.stdout, r.stdout
-    assert env.version() == "1.1.0"
+    assert f"OK: version {CUR}" in r.stdout, r.stdout
+    assert env.version() == CUR
     assert (env.gw / ".git").exists() and (env.gw / "restarted").exists()
     assert env.db_rows() == ["precious reading"]                       # database untouched
     assert len(list((env.gw / "db-backups").glob("bridge-*.db"))) == 1  # ...and backed up first
@@ -100,28 +103,28 @@ def test_second_run_without_changes_does_nothing(env):
 
 def test_new_release_is_deployed(env):
     env.update("main")
-    (env.work / "app.py").write_text((env.work / "app.py").read_text().replace('APP_VERSION = "1.1.0"', 'APP_VERSION = "1.2.0"'))
+    (env.work / "app.py").write_text((env.work / "app.py").read_text().replace(f'APP_VERSION = "{CUR}"', f'APP_VERSION = "{NEXT}"'))
     env.commit("release 2")
     r = env.update()
-    assert "OK: version 1.2.0" in r.stdout and env.version() == "1.2.0"
+    assert f"OK: version {NEXT}" in r.stdout and env.version() == NEXT
     assert env.db_rows() == ["precious reading"]
 
 
 def test_unhealthy_release_is_rolled_back_with_the_database(env):
     env.update("main")
     # release 2 "migrates" the database and then does not start
-    (env.work / "app.py").write_text((env.work / "app.py").read_text().replace('APP_VERSION = "1.1.0"', 'APP_VERSION = "1.2.0"'))
+    (env.work / "app.py").write_text((env.work / "app.py").read_text().replace(f'APP_VERSION = "{CUR}"', f'APP_VERSION = "{NEXT}"'))
     env.commit("broken release")
     env.healthy(False)
     # the broken release starts, migrates/writes to the database, and then never answers
     migrate = env.tmp / "migrate.py"
     migrate.write_text(f"import sqlite3\n"
-                       f"if '1.2.0' in open('{env.gw}/app.py').read():      # only the broken release misbehaves\n"
+                       f"if '{NEXT}' in open('{env.gw}/app.py').read():      # only the broken release misbehaves\n"
                        f"    c = sqlite3.connect('{env.gw}/bridge.db')\n"
                        "    c.execute(\"INSERT INTO history(v) VALUES('written by broken release')\")\n    c.commit()\n")
     r = env.update(check=False, extra={"RESTART_CMD": f"python3 {migrate}"})
     assert r.returncode == 1 and "ROLLING BACK" in r.stdout
-    assert env.version() == "1.1.0"                                     # previous code is back
+    assert env.version() == CUR                                     # previous code is back
     assert env.db_rows() == ["precious reading"]                        # database from before the update
 
 
@@ -132,7 +135,7 @@ def test_syntax_error_never_reaches_a_restart(env):
     env.commit("syntax error")
     r = env.update(check=False)
     assert r.returncode == 1 and "does not compile" in r.stdout
-    assert env.version() == "1.1.0"
+    assert env.version() == CUR
     assert (env.gw / "restarted").exists()           # restarted only by the rollback, to bring the old code back
 
 
@@ -147,11 +150,11 @@ def test_failed_first_install_restores_the_original_gateway(env):
 
 def test_manual_rollback(env):
     env.update("main")
-    (env.work / "app.py").write_text((env.work / "app.py").read_text().replace('APP_VERSION = "1.1.0"', 'APP_VERSION = "1.2.0"'))
+    (env.work / "app.py").write_text((env.work / "app.py").read_text().replace(f'APP_VERSION = "{CUR}"', f'APP_VERSION = "{NEXT}"'))
     env.commit("release 2")
     env.update()
     r = env.update("--rollback", extra={"YES": "1"})
-    assert "rolled back" in r.stdout and env.version() == "1.1.0"
+    assert "rolled back" in r.stdout and env.version() == CUR
 
 
 def test_wrong_branch_fails_cleanly_and_changes_nothing(env):

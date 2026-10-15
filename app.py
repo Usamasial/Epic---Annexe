@@ -24,7 +24,7 @@ from typing import Optional, Dict, List
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 DB_PATH = Path("bridge.db")
 BACKUP_DIR = Path("backup")   # CSV copy of everything sent to IDMS (see BackupWriter)
 WEB_PORT = 8000
@@ -1685,27 +1685,30 @@ def api_meter_rename(meter_code: str, payload: dict = Body(...)):
 
 @app.put("/api/meters/{meter_code}/interval")
 def api_meter_interval(meter_code: str, payload: dict = Body(...)):
-    v = payload.get("polling_interval")
-    minutes = int(v) if v not in (None, "") else None
+    minutes, err = _minutes_or_none(payload.get("polling_interval"), "Poll interval")
+    if err: return bad(err)
     if not store.update_meter_interval(meter_code, minutes): return bad("Not found.", 404)
     return {"ok": True}
 
 @app.put("/api/meters/{meter_code}/publish-interval")
 def api_meter_publish_interval(meter_code: str, payload: dict = Body(...)):
-    v = payload.get("publish_interval")
-    minutes = int(v) if v not in (None, "") else None
+    minutes, err = _minutes_or_none(payload.get("publish_interval"), "Publish interval")
+    if err: return bad(err)
     if not store.update_meter_publish_interval(meter_code, minutes): return bad("Not found.", 404)
     return {"ok": True}
 
 @app.put("/api/zlans/{zlan_ip}/interval")
 def api_zlan_interval(zlan_ip: str, payload: dict = Body(...)):
-    if not store.update_zlan_interval(zlan_ip, int(payload["default_polling_interval"])): return bad("Not found.", 404)
+    minutes, err = _minutes_or_none(payload.get("default_polling_interval"), "Interval")
+    if err: return bad(err)
+    if minutes is None: return bad("Interval is required (minutes, 1 or more).")
+    if not store.update_zlan_interval(zlan_ip, minutes): return bad("Not found.", 404)
     return {"ok": True}
 
 @app.put("/api/zlans/{zlan_ip}/publish-interval")
 def api_zlan_publish_interval(zlan_ip: str, payload: dict = Body(...)):
-    v = payload.get("default_publish_interval")
-    minutes = int(v) if v not in (None, "") else None
+    minutes, err = _minutes_or_none(payload.get("default_publish_interval"), "Publish interval")
+    if err: return bad(err)
     if not store.update_zlan_publish_interval(zlan_ip, minutes): return bad("Not found.", 404)
     return {"ok": True}
 

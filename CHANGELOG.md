@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1
+**Fixed**
+- ZLAN / Meter / Parameter tables lost whatever you had typed (and sometimes the value you were about to save):
+  they re-draw themselves every few seconds and on every connectivity event, and the re-draw reset all input boxes.
+  Typed-but-unsaved values (and the cursor) now survive the refresh; unsaved boxes are highlighted.
+- Saving an interval now shows "✓ Saved" (or "✗ <reason>") right next to the Save button.
+- The server now rejects ZLAN / meter intervals that are blank, 0, negative, non-numeric or longer than a year
+  (a 0-minute poll interval used to be accepted and made the poller run without any delay).
+
 ## 1.1.0
 **Fixed**
 - **MD, voltage and current readings were being dropped.** The publish throttle was tracked per meter, so after kWh

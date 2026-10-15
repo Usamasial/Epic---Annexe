@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Modbus Bridge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<div id="login-screen" class="login-wrap">
+  <div class="login-card">
+    <div class="brand-mark"></div>
+    <h1>Modbus Bridge</h1>
+    <div id="login-form">
+      <input type="text" id="login-user" placeholder="Username" value="admin">
+      <input type="password" id="login-pass" placeholder="Password">
+      <button class="btn-primary" id="btn-login" style="width:100%">Sign in</button>
+      <p class="msg" id="login-msg"></p>
+    </div>
+  </div>
+</div>
+
+<div id="app" class="frame" style="display:none;">
+  <header class="topbar">
+    <div class="brand"><div class="brand-mark"></div><div><h1>Modbus Bridge</h1></div></div>
+    <div class="topbar-status">
+      <div class="status-chip" id="chip-system"><span class="dot"></span><span id="system-state">&hellip;</span></div>
+      <div class="status-chip" id="chip-broker"><span class="dot"></span><span id="broker-state">&hellip;</span></div>
+      <button class="btn-ghost" id="btn-logout">Sign out</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="zlans">ZLANs &amp; Meters</button>
+    <button class="tab" data-tab="parameters">Parameters</button>
+    <button class="tab" data-tab="queue">Queue</button>
+    <button class="tab" data-tab="history">History</button>
+    <button class="tab" data-tab="connectivity">Connectivity</button>
+    <button class="tab" data-tab="output">Output</button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </nav>
+
+  <main>
+    <!-- DASHBOARD -->
+    <section class="panel active" id="panel-dashboard">
+      <div class="kpi-row">
+        <div class="kpi"><span class="kpi-label">ZLANs</span><span class="kpi-value" id="kpi-zlans">0/0</span></div>
+        <div class="kpi"><span class="kpi-label">Meters</span><span class="kpi-value" id="kpi-meters">0/0</span></div>
+        <div class="kpi"><span class="kpi-label">Queued</span><span class="kpi-value warn" id="kpi-queued">0</span></div>
+        <div class="kpi"><span class="kpi-label">Released</span><span class="kpi-value good" id="kpi-released">0</span></div>
+        <div class="kpi"><span class="kpi-label">Failed</span><span class="kpi-value bad" id="kpi-failed">0</span></div>
+      </div>
+      <section class="card">
+        <div class="card-head"><h2>Per-ZLAN status</h2></div>
+        <div class="table-wrap"><table><thead><tr><th>ZLAN</th><th>Status</th><th>Meters connected</th><th>Queued</th><th>Released</th><th>Failed</th></tr></thead><tbody id="zlan-status-rows"></tbody></table></div>
+      </section>
+    </section>
+
+    <!-- ZLANS & METERS -->
+    <section class="panel" id="panel-zlans">
+      <section class="card">
+        <div class="card-head"><h2>ZLANs</h2></div>
+        <div class="add-form">
+          <label>ZLAN IP<input type="text" id="new-zlan-ip" placeholder="192.168.50.x"></label>
+          <label>Label<input type="text" id="new-zlan-label" placeholder="WH35"></label>
+          <label>Default interval (min)<input type="number" id="new-zlan-interval" value="30"></label>
+          <label>Port<input type="number" id="new-zlan-port" value="502"></label>
+          <button class="btn-primary" id="btn-add-zlan">Add ZLAN</button>
+        </div>
+        <p class="msg" id="zlan-msg"></p>
+        <div class="table-wrap"><table><thead><tr><th>IP</th><th>Label</th><th>Interval (min)</th><th>Default publish (min)</th><th>Port</th><th></th></tr></thead><tbody id="zlan-rows"></tbody></table></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Meters</h2></div>
+        <div class="add-form">
+          <label>ZLAN<select id="new-meter-zlan"></select></label>
+          <label>Meter count for this ZLAN<input type="number" id="meter-count-input" min="1"></label>
+          <button class="btn-primary" id="btn-gen-slots">Generate naming slots</button>
+        </div>
+        <div id="meter-slots"></div>
+        <p class="msg" id="meter-msg"></p>
+        <div class="add-form">
+          <label>Bulk upload CSV (zlan_ip,zlan_label,meter_count,unit_id,meter_code,polling_interval_minutes)<input type="file" id="bulk-csv"></label>
+          <button class="btn-ghost" id="btn-bulk-upload">Upload</button>
+        </div>
+        <input type="text" class="search-input" id="meter-search" placeholder="Search meter code...">
+        <div class="table-wrap tall"><table><thead><tr><th>Meter</th><th>ZLAN</th><th>Unit</th><th>Poll (min)</th><th>Publish (min)</th><th>Status</th><th>Last poll</th><th></th></tr></thead><tbody id="meter-rows"></tbody></table></div>
+      </section>
+    </section>
+
+    <!-- PARAMETERS -->
+    <section class="panel" id="panel-parameters">
+      <section class="card">
+        <div class="card-head"><h2>Parameters</h2></div>
+        <div class="add-form">
+          <label>Label<input type="text" id="new-param-label" placeholder="kwh"></label>
+          <label>Address<input type="number" id="new-param-address" placeholder="32784"></label>
+          <label>Wire code<input type="text" id="new-param-wire" placeholder="P005"></label>
+          <label>Priority<input type="number" id="new-param-priority" value="100"></label>
+          <label>Min value<input type="number" id="new-param-min" step="any"></label>
+          <label>Max value<input type="number" id="new-param-max" step="any"></label>
+          <button class="btn-primary" id="btn-add-param">Add</button>
+        </div>
+        <p class="msg" id="param-msg"></p>
+        <div class="table-wrap"><table><thead><tr><th>Label</th><th>Address</th><th>Wire</th><th>Priority</th><th>Min</th><th>Max</th><th></th></tr></thead><tbody id="param-rows"></tbody></table></div>
+      </section>
+    </section>
+
+    <!-- QUEUE -->
+    <section class="panel" id="panel-queue">
+      <section class="card">
+        <div class="card-head"><h2>Queue</h2><button class="btn-ghost" onclick="exportTable('queue')">Export CSV</button></div>
+        <input type="text" class="search-input" id="queue-search" placeholder="Search...">
+        <div class="table-wrap tall"><table><thead><tr><th>Meter</th><th>Param</th><th>Value</th><th>Created</th><th>Attempts</th><th>Priority</th><th>State</th></tr></thead><tbody id="queue-rows"></tbody></table></div>
+        <div class="pagination" id="queue-pagination"></div>
+      </section>
+    </section>
+
+    <!-- HISTORY -->
+    <section class="panel" id="panel-history">
+      <section class="card">
+        <div class="card-head"><h2>History</h2>
+          <div>
+            <button class="btn-ghost" onclick="retryAllFailed()">Retry All Failed</button>
+            <button class="btn-ghost" onclick="exportTable('history')">Export CSV</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <input type="text" id="history-search" placeholder="Search...">
+          <select id="history-status-filter"><option value="">All statuses</option><option value="queued">Queued</option><option value="released">Released</option><option value="failed">Failed</option><option value="dropped">Dropped</option></select>
+          <input type="text" id="history-meter-filter" placeholder="Meter code">
+          <input type="text" id="history-param-filter" placeholder="Parameter">
+          <input type="date" id="history-date-from">
+          <input type="date" id="history-date-to">
+        </div>
+        <div class="filter-row">
+          <button class="btn-delete" onclick="deleteHistorySelected()">Delete Selected</button>
+          <span>Delete older than:</span>
+          <button class="btn-ghost" onclick="deleteHistoryMonths(1)">1mo</button>
+          <button class="btn-ghost" onclick="deleteHistoryMonths(2)">2mo</button>
+          <button class="btn-ghost" onclick="deleteHistoryMonths(3)">3mo</button>
+          <button class="btn-ghost" onclick="deleteHistoryMonths(6)">6mo</button>
+          <button class="btn-ghost" onclick="deleteHistoryMonths(12)">12mo</button>
+          <input type="date" id="history-delete-custom">
+          <button class="btn-ghost" onclick="deleteHistoryCustom()">Delete before date</button>
+          <button class="btn-delete" onclick="deleteHistoryAll()">Delete All</button>
+        </div>
+        <div class="table-wrap tall"><table><thead><tr>
+          <th><input type="checkbox" id="history-select-all"></th>
+          <th class="sortable" data-sort="meter_code">Meter</th>
+          <th class="sortable" data-sort="parameter">Param</th>
+          <th class="sortable" data-sort="value">Value</th>
+          <th class="sortable" data-sort="date_time">Created</th>
+          <th class="sortable" data-sort="released_at">Released</th>
+          <th class="sortable" data-sort="status">Status</th>
+          <th>Server message</th><th></th></tr></thead><tbody id="history-rows"></tbody></table></div>
+        <div class="pagination" id="history-pagination"></div>
+      </section>
+    </section>
+
+    <!-- CONNECTIVITY -->
+    <section class="panel" id="panel-connectivity">
+      <section class="card">
+        <div class="card-head"><h2>Connectivity history</h2><button class="btn-ghost" onclick="exportConnectivity()">Export CSV</button></div>
+        <div class="filter-row">
+          <select id="conn-entity-type"><option value="">ZLAN + Meter</option><option value="zlan">ZLAN only</option><option value="meter">Meter only</option></select>
+          <select id="conn-zlan-filter"><option value="">All ZLANs</option></select>
+          <input type="text" id="conn-entity-id" placeholder="Meter code / ZLAN IP search">
+          <select id="conn-range-preset">
+            <option value="">All time</option>
+            <option value="daily">Today</option>
+            <option value="weekly">Last 7 days</option>
+            <option value="monthly">Last 30 days</option>
+            <option value="custom">Custom range</option>
+          </select>
+          <input type="date" id="conn-date-from" style="display:none;">
+          <input type="date" id="conn-date-to" style="display:none;">
+        </div>
+        <div class="filter-row">
+          <button class="btn-delete" onclick="deleteConnectivitySelected()">Delete Selected</button>
+          <span>Delete older than:</span>
+          <button class="btn-ghost" onclick="deleteConnectivityMonths(1)">1mo</button>
+          <button class="btn-ghost" onclick="deleteConnectivityMonths(2)">2mo</button>
+          <button class="btn-ghost" onclick="deleteConnectivityMonths(3)">3mo</button>
+          <button class="btn-ghost" onclick="deleteConnectivityMonths(6)">6mo</button>
+          <button class="btn-ghost" onclick="deleteConnectivityMonths(12)">12mo</button>
+          <input type="date" id="conn-delete-custom">
+          <button class="btn-ghost" onclick="deleteConnectivityCustom()">Delete before date</button>
+          <button class="btn-delete" onclick="deleteConnectivityAll()">Delete All</button>
+        </div>
+        <div class="table-wrap tall"><table><thead><tr><th><input type="checkbox" id="conn-select-all"></th><th>Type</th><th>Entity</th><th>ZLAN</th><th>Status</th><th>Delivery</th><th>At</th></tr></thead><tbody id="connectivity-rows"></tbody></table></div>
+        <div class="pagination" id="connectivity-pagination"></div>
+      </section>
+    </section>
+
+    <!-- OUTPUT -->
+    <section class="panel" id="panel-output">
+      <section class="card">
+        <div class="card-head"><h2>Output connection</h2></div>
+        <div class="add-form"><label>Type<select id="conn-type"><option value="http">HTTP API</option><option value="mqtt">MQTT</option></select></label></div>
+        <div id="http-fields" class="add-form"><label style="flex:1">URL<input type="text" id="out-url" style="width:100%"></label></div>
+        <div id="mqtt-fields" style="display:none;">
+          <div class="add-form">
+            <label>Broker<input type="text" id="mqtt-broker"></label>
+            <label>Port<input type="number" id="mqtt-port"></label>
+            <label>Topic template<input type="text" id="mqtt-topic-tmpl"></label>
+          </div>
+          <div class="add-form">
+            <label>Username (optional)<input type="text" id="mqtt-username"></label>
+            <label>Password (optional)<input type="password" id="mqtt-password"></label>
+          </div>
+          <div class="add-form">
+            <label>Response topic<input type="text" id="mqtt-resp-topic"></label>
+            <label>Response timeout (s)<input type="number" id="mqtt-resp-timeout"></label>
+          </div>
+          <div class="add-form">
+            <label style="flex:1">Connectivity topic template<input type="text" id="mqtt-conn-topic-tmpl" style="width:100%" placeholder="ksb/connectivity/{entity_id}"></label>
+          </div>
+        </div>
+        <label class="switch-row"><input type="checkbox" id="out-enabled"><span class="slider"></span><span>Enabled</span></label>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-output">Save</button><span class="msg" id="output-msg"></span></div>
+      </section>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="panel" id="panel-settings">
+      <section class="card">
+        <div class="card-head"><h2>Queue &amp; retry</h2></div>
+        <div class="add-form">
+          <label>Max attempts<input type="number" id="set-max-attempts"></label>
+          <label>Max queue size<input type="number" id="set-max-queue"></label>
+          <label>Queue retention (days, 0=forever)<input type="number" id="set-queue-retention"></label>
+        </div>
+        <p class="msg">Stuck queue items older than this are removed and marked "failed" in History, instead of retrying forever. Separate from "Max queue size", which is a count cap, not time-based.</p>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-settings">Save</button><span class="msg" id="settings-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>History &amp; Connectivity retention</h2></div>
+        <div class="add-form">
+          <label>History retention (days, 0=forever)<input type="number" id="set-retention"></label>
+          <label>Connectivity retention (days, 0=forever)<input type="number" id="set-conn-retention"></label>
+        </div>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-history-retention">Save</button><span class="msg" id="history-retention-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Publish throttle (reading rate vs. publish rate)</h2></div>
+        <label class="switch-row"><input type="checkbox" id="set-publish-throttle-enabled"><span class="slider"></span><span>Enable publish throttling</span></label>
+        <label class="switch-row"><input type="checkbox" id="set-log-skipped-events"><span class="slider"></span><span>Log skipped/dropped readings</span></label>
+        <p class="msg">Set each meter's "Publish (min)" interval in the ZLANs &amp; Meters tab. When enabled, readings faster than that interval are dropped.</p>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-throttle">Save</button><span class="msg" id="throttle-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Connectivity debounce</h2></div>
+        <label class="switch-row"><input type="checkbox" id="set-connectivity-debounce-enabled"><span class="slider"></span><span>Enable connectivity debounce</span></label>
+        <div class="add-form">
+          <label>Minimum gap between publishes (seconds)<input type="number" id="set-connectivity-min-gap"></label>
+        </div>
+        <p class="msg">Local Connectivity history always records every event -- this only limits how often flapping status changes are pushed to MQTT/HTTP.</p>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-debounce">Save</button><span class="msg" id="debounce-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Connectivity heartbeat</h2></div>
+        <label class="switch-row"><input type="checkbox" id="set-heartbeat-enabled"><span class="slider"></span><span>Enable heartbeat</span></label>
+        <div class="add-form">
+          <label>Re-confirm status after (hours)<input type="number" id="set-heartbeat-hours"></label>
+          <label>How often to check (minutes)<input type="number" id="set-heartbeat-check-minutes"></label>
+        </div>
+        <p class="msg">If a meter or ZLAN's status hasn't changed in this many hours, its current status is re-sent as a fresh signal -- so a long-stable (or long-stuck) connection still shows recent proof-of-life instead of a stale multi-day-old entry.</p>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-heartbeat">Save</button><span class="msg" id="heartbeat-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Modbus polling (RS-485/ZLAN tuning)</h2></div>
+        <div class="add-form">
+          <label>Client timeout (seconds)<input type="number" step="0.1" id="set-modbus-timeout"></label>
+          <label>Inter-request delay (seconds)<input type="number" step="0.1" id="set-inter-delay"></label>
+        </div>
+        <p class="msg">Applies to newly (re)started ZLAN connections &mdash; restart the app for a change to take effect on ZLANs already polling.</p>
+        <div class="card-actions"><button class="btn-primary" id="btn-save-modbus-tuning">Save</button><span class="msg" id="modbus-tuning-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Configuration backup</h2></div>
+        <div class="card-actions">
+          <button class="btn-ghost" id="btn-export-config">Export configuration</button>
+          <input type="file" id="import-file" style="display:none;">
+          <button class="btn-ghost" id="btn-import-config">Import configuration</button>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Change password</h2></div>
+        <div class="add-form">
+          <label>Current<input type="password" id="pw-current"></label>
+          <label>New<input type="password" id="pw-new"></label>
+        </div>
+        <div class="card-actions"><button class="btn-primary" id="btn-change-pw">Update password</button><span class="msg" id="pw-msg"></span></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>App control</h2></div>
+        <div class="card-actions">
+          <button class="btn-ghost" onclick="restartApp()">Restart App</button>
+          <span class="msg">Restarts just this process (not the machine) -- back up in a few seconds.</span>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Reset</h2></div>
+        <div class="card-actions">
+          <button class="btn-ghost" onclick="resetSettingsOnly()">Reset Settings Only</button>
+          <span class="msg">Restores all settings to defaults. Login and data are untouched.</span>
+        </div>
+        <div class="card-actions" style="margin-top:10px;">
+          <button class="btn-delete" onclick="factoryReset()">Factory Reset (wipes everything)</button>
+          <span class="msg">Deletes ALL ZLANs, meters, parameters, history, and settings -- including login. Requires your password. App restarts automatically after.</span>
+        </div>
+      </section>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

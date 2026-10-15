@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pymodbus>=3.6,<4
+requests
+paho-mqtt>=2.0,<3

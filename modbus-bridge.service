@@ -1,0 +1,15 @@
+[Unit]
+Description=Modbus Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/modbus_bridge
+ExecStart=/opt/modbus_bridge/venv/bin/python /opt/modbus_bridge/app.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

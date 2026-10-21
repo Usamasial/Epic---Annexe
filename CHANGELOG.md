@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.1
+**Fixed: the app became very slow / unresponsive on gateways with a large history** (seen on a gateway with 81 active
+meters and 620 000 history rows: pages took 10-15 s, MQTT `Keep alive timeout` disconnects, and the update script's
+health check timed out and rolled back although the new version had started correctly).
+- Every dashboard request ran five full scans of the `history` table while holding the single database lock that the
+  poll threads, MQTT acknowledgements and the login check also need. The page called the dashboard on every live event
+  (several per second) as well as on a timer.
+- Heavy read-only queries (dashboard counts, History / Queue / Connectivity pages) now run on their **own read-only
+  connection** (SQLite WAL lets readers and the writer work side by side) and can no longer block anything else.
+- The dashboard counts come from **one** scan instead of five and are cached; the recompute interval grows with the
+  time the scan took (about 5% of a core at most). Numbers can therefore be a few seconds old on a large database.
+- The page refreshes the dashboard / meters / connectivity at most once every 3 s, and not at all while the browser
+  tab is in the background.
+- Measured on a 620 000-row database with 3 open dashboard tabs: health check 549 ms -> 4 ms, dashboard 1.16 s -> 5 ms.
+- `deploy/update.sh`: waits up to 120 s (was 40 s) for the app, each check allows 10 s (was 3 s), ignores any
+  proxy settings for the local check, and prints the last log lines of a version that had to be rolled back.
+
 ## 1.2.0
 **Output tab (connection settings) reworked**
 - Required fields are marked `*` and checked before saving, with a message under each wrong box (address typed as

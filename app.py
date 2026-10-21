@@ -8,6 +8,7 @@ Built directly against the finalized Scope of Work (12 sections).
 import asyncio, base64, csv, hashlib, hmac, io, json, logging, os, re, secrets, signal, sys
 import queue as _queue_mod
 import ipaddress, shutil, socket, sqlite3, struct, threading, time
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Optional, Dict, List
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DB_PATH = Path("bridge.db")
 BACKUP_DIR = Path("backup")   # CSV copy of everything sent to IDMS (see BackupWriter)
 WEB_PORT = 8000
@@ -295,6 +296,10 @@ class _Rows:
 
 class Store:
     def __init__(self, path: Path):
+        self.path = Path(path)
+        self._rc = None                    # separate read-only connection for heavy queries (see _rq)
+        self._rlock = threading.Lock()
+        self._stats, self._stats_lock = None, threading.Lock()
         self.lock = threading.RLock()  # RLock, not Lock: several methods call other
             # locked methods internally (e.g. mark_meter_result -> log_connectivity),
             # which would deadlock a plain Lock on the same thread. RLock allows safe
@@ -371,6 +376,26 @@ class Store:
             res = _Rows(rows, cur.rowcount, cur.lastrowid)
             cur.close()
             return res
+
+    def _rq(self, sql, params=()):
+        """Heavy READ-ONLY queries (dashboard counts, History / Queue / Connectivity pages) run on their own
+        connection. With WAL, readers and the writer do not block each other, so a slow query over a large history
+        can no longer hold the main lock that every poll thread, MQTT acknowledgement and login check needs.
+        Falls back to the main connection if a read-only connection cannot be opened."""
+        with self._rlock:
+            if self._rc is None:
+                try:
+                    uri = "file:" + quote(str(self.path.resolve())) + "?mode=ro"
+                    self._rc = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=10)
+                except sqlite3.Error:
+                    self._rc = False
+            if self._rc:
+                cur = self._rc.execute(sql, params)
+                rows = cur.fetchall() if cur.description is not None else []
+                res = _Rows(rows, cur.rowcount, cur.lastrowid)
+                cur.close()
+                return res
+        return self._q(sql, params)
 
     def get(self, k):
         r = self._q("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
@@ -643,8 +668,8 @@ class Store:
             if len(date_to) == 10: date_to = date_to + " 23:59:59.999999"
             cl.append("ch.at <= ?"); pr.append(date_to)
         where = "WHERE " + " AND ".join(cl) if cl else ""
-        total = self._q(f"SELECT COUNT(*) {base} {where}", pr).fetchone()[0]
-        rows = self._q(f"""SELECT ch.entity_type,ch.entity_id,ch.status,ch.at,ch.msg_no,ch.delivery_status,ch.released_at,ch.failed_at,ch.error_message,
+        total = self._rq(f"SELECT COUNT(*) {base} {where}", pr).fetchone()[0]
+        rows = self._rq(f"""SELECT ch.entity_type,ch.entity_id,ch.status,ch.at,ch.msg_no,ch.delivery_status,ch.released_at,ch.failed_at,ch.error_message,
             z.zlan_ip, z.zlan_label
             {base} {where} ORDER BY ch.at DESC, ch.id DESC LIMIT ? OFFSET ?""", pr+[limit,offset]).fetchall()
         items = [{"entity_type":r[0],"entity_id":r[1],"status":r[2],"at":r[3],"msg_no":r[4],
@@ -652,14 +677,52 @@ class Store:
                    "zlan_ip":r[9],"zlan_label":r[10]} for r in rows]
         return items, total
 
+    def dashboard_stats(self):
+        """Message counts for the dashboard (overall and per ZLAN) from ONE scan of history, cached.
+        A big history (hundreds of thousands of rows) makes this slow, so the recompute interval grows with the
+        time it took (about 5% of one core at most); a thread that arrives while another is computing gets the
+        previous numbers instead of piling on."""
+        c = self._stats
+        if c and time.time() < c["until"]:
+            return c["value"]
+        if not self._stats_lock.acquire(blocking=False):
+            if c: return c["value"]
+            with self._stats_lock:                      # very first call: wait for the other thread's result
+                return self._stats["value"] if self._stats else self._compute_stats()
+        try:
+            return self._compute_stats()
+        finally:
+            self._stats_lock.release()
+
+    def _compute_stats(self):
+        t0 = time.time()
+        hist = self._rq("SELECT meter_code, status, COUNT(*) FROM history GROUP BY meter_code, status").fetchall()
+        zlan_of = dict(self._rq("SELECT meter_code, zlan_ip FROM meters").fetchall())
+        queued_rows = self._rq("SELECT meter_code, COUNT(*) FROM queue GROUP BY meter_code").fetchall()
+        blank = lambda: {"queued": 0, "released": 0, "failed": 0}
+        released = failed = total = queued = 0
+        per_zlan = {}
+        for meter, status, n in hist:
+            total += n
+            if status == "released": released += n
+            elif status == "failed": failed += n
+            z = zlan_of.get(meter)
+            if z and status in ("released", "failed"):
+                per_zlan.setdefault(z, blank())[status] += n
+        for meter, n in queued_rows:
+            queued += n
+            z = zlan_of.get(meter)
+            if z: per_zlan.setdefault(z, blank())["queued"] += n
+        value = {"counts": {"queued": queued, "released": released, "failed": failed, "total": total}, "per_zlan": per_zlan}
+        took = time.time() - t0
+        self._stats = {"value": value, "until": time.time() + min(120.0, max(2.0, took * 20))}
+        return value
+
+    def counts(self):
+        return self.dashboard_stats()["counts"]
+
     def per_zlan_message_counts(self):
-        result = {}
-        q_rows = self._q("""SELECT m.zlan_ip, COUNT(*) FROM queue q JOIN meters m ON m.meter_code=q.meter_code GROUP BY m.zlan_ip""").fetchall()
-        for ip, c in q_rows: result.setdefault(ip, {"queued":0,"released":0,"failed":0})["queued"] = c
-        h_rows = self._q("""SELECT m.zlan_ip, h.status, COUNT(*) FROM history h JOIN meters m ON m.meter_code=h.meter_code
-            WHERE h.status IN ('released','failed') GROUP BY m.zlan_ip, h.status""").fetchall()
-        for ip, status, c in h_rows: result.setdefault(ip, {"queued":0,"released":0,"failed":0})[status] = c
-        return result
+        return self.dashboard_stats()["per_zlan"]
 
     def mark_meter_result(self, meter_code, ok: bool, cascade: bool = False):
         """cascade=True: a ZLAN-level failure marking a meter that wasn't
@@ -867,8 +930,8 @@ class Store:
         cl, pr = [], []
         if search: cl.append("(q.meter_code LIKE ? OR q.parameter LIKE ?)"); pr += [f"%{search}%"]*2
         where = "WHERE " + " AND ".join(cl) if cl else ""
-        total = self._q(f"SELECT COUNT(*) FROM queue q {where}", pr).fetchone()[0]
-        rows = self._q(f"""SELECT q.meter_code,q.parameter,q.value,q.date_time,q.msg_no,q.attempts,
+        total = self._rq(f"SELECT COUNT(*) FROM queue q {where}", pr).fetchone()[0]
+        rows = self._rq(f"""SELECT q.meter_code,q.parameter,q.value,q.date_time,q.msg_no,q.attempts,
             COALESCE(p.priority,100),q.awaiting_response FROM queue q LEFT JOIN parameters p ON p.label=q.parameter {where}
             ORDER BY COALESCE(p.priority,100) ASC, q.created_at ASC LIMIT ? OFFSET ?""", pr+[limit,offset]).fetchall()
         items = [{"meter_code":r[0],"parameter":r[1],"value":r[2],"date_time":r[3],"msg_no":r[4],
@@ -895,18 +958,12 @@ class Store:
         where = "WHERE " + " AND ".join(cl) if cl else ""
         col = self._HISTORY_SORT_COLUMNS.get(order_by, "created_at")
         direction = "ASC" if str(order_dir).lower() == "asc" else "DESC"
-        total = self._q(f"SELECT COUNT(*) FROM history {where}", pr).fetchone()[0]
-        rows = self._q(f"""SELECT meter_code,parameter,value,date_time,msg_no,status,created_at,released_at,failed_at,error_message
+        total = self._rq(f"SELECT COUNT(*) FROM history {where}", pr).fetchone()[0]
+        rows = self._rq(f"""SELECT meter_code,parameter,value,date_time,msg_no,status,created_at,released_at,failed_at,error_message
             FROM history {where} ORDER BY {col} {direction}, id DESC LIMIT ? OFFSET ?""", pr+[limit,offset]).fetchall()
         items = [{"meter_code":r[0],"parameter":r[1],"value":r[2],"date_time":r[3],"msg_no":r[4],"status":r[5],
                    "created_at":r[6],"released_at":r[7],"failed_at":r[8],"error_message":r[9]} for r in rows]
         return items, total
-
-    def counts(self):
-        released = self._q("SELECT COUNT(*) FROM history WHERE status='released'").fetchone()[0]
-        failed = self._q("SELECT COUNT(*) FROM history WHERE status='failed'").fetchone()[0]
-        total = self._q("SELECT COUNT(*) FROM history").fetchone()[0]
-        return {"queued": self.queue_count(), "released": released, "failed": failed, "total": total}
 
     def purge_expired(self):
         days = int(self.get("retention_days") or 0)

@@ -46,8 +46,8 @@ Output ends with `OK: version 1.x.y`. The version is also shown at the top of th
 Roll out to **one gateway first**, check the dashboard, then the other seven.
 
 What the script does: backs up `bridge.db` (SQLite online backup, low priority) and the current code → fetches →
-installs requirements only if they changed → syntax check → restarts `modbus-bridge` → waits up to 40 s for the web
-app to answer. **If anything fails it restores the previous code and database by itself.**
+installs requirements only if they changed → syntax check → restarts `modbus-bridge` → waits up to 120 s for the web
+app to answer (`HEALTH_TIMEOUT=300 bash deploy/update.sh` for a very busy gateway). **If anything fails it restores the previous code and database by itself.**
 
 Manual rollback (code **and** database back to just before the last update; readings stored since then are removed
 from `bridge.db` but remain in `backup/*.csv`):

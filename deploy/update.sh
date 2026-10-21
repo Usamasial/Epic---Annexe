@@ -20,7 +20,8 @@ APP_DIR="${APP_DIR:-/opt/modbus_bridge}"
 DEFAULT_REPO_URL="https://github.com/usamasial/epic---annexe.git"
 SERVICE="${SERVICE:-modbus-bridge}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8000/api/auth/status}"
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-40}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"      # busy gateways (hundreds of meters) can take a while to start answering
+HEALTH_REQUEST_TIMEOUT="${HEALTH_REQUEST_TIMEOUT:-10}"
 RESTART_CMD="${RESTART_CMD:-systemctl restart $SERVICE}"
 STOP_CMD="${STOP_CMD:-systemctl stop $SERVICE}"
 KEEP="${KEEP:-5}"
@@ -31,9 +32,11 @@ die()  { echo "[update] ERROR: $*" >&2; exit 1; }
 
 health_ok() {
   if [ -n "${HEALTH_CMD:-}" ]; then eval "$HEALTH_CMD" >/dev/null 2>&1; return; fi
-  python3 - "$HEALTH_URL" <<'PY' >/dev/null 2>&1
+  python3 - "$HEALTH_URL" "$HEALTH_REQUEST_TIMEOUT" <<'PY' >/dev/null 2>&1
 import sys, urllib.request
-urllib.request.urlopen(sys.argv[1], timeout=3).read()
+# no proxy for the local check, whatever the environment says
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+opener.open(sys.argv[1], timeout=float(sys.argv[2])).read()
 PY
 }
 
@@ -42,6 +45,7 @@ wait_healthy() {
   while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
     health_ok && return 0
     sleep 2; waited=$((waited + 2))
+    [ $((waited % 20)) -eq 0 ] && log "still waiting for the app to answer (${waited}s of ${HEALTH_TIMEOUT}s)..."
   done
   return 1
 }
@@ -55,6 +59,10 @@ lowprio() {  # keep the gateway responsive while copying a large database
 # ---------------------------------------------------------------- rollback
 do_rollback() {  # $1 = stamp, $2 = old commit or "none", $3 = reason
   log "ROLLING BACK ($3)"
+  if command -v journalctl >/dev/null 2>&1; then
+    log "last log lines of the version that failed:"
+    journalctl -u "$SERVICE" -n 40 --no-pager 2>/dev/null | grep -v "MQTT message received" | tail -12 | sed 's/^/[update]   /' || true
+  fi
   eval "$STOP_CMD" || true
   local code="$APP_DIR/code-backups/code-$1.tgz" db="$APP_DIR/db-backups/bridge-$1.db"
   if [ -f "$code" ]; then

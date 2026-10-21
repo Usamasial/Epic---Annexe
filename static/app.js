@@ -828,15 +828,33 @@ async function factoryReset(){
   waitForApp("Factory reset complete. The app is restarting\u2026");
 }
 
+// -- refresh policy --
+// A busy gateway emits several live events per second. Reloading the dashboard / meters / connectivity on EVERY
+// event (and on a timer, even in a background tab) kept the gateway's database busy for nothing, so refreshes are
+// limited to one per 3 s and are skipped while the tab is hidden.
+function throttled(fn, ms) {
+  let last = 0, timer = null;
+  return function () {
+    if (document.hidden) return;
+    const wait = ms - (Date.now() - last);
+    if (wait <= 0) { last = Date.now(); fn(); }
+    else if (!timer) timer = setTimeout(() => { timer = null; last = Date.now(); fn(); }, wait);
+  };
+}
+const refreshDashboard = throttled(() => loadDashboard(), 3000);
+const refreshMeters = throttled(() => loadMeters(), 3000);
+const refreshZlans = throttled(() => loadZlans(), 3000);
+const refreshConnectivity = throttled(() => loadConnectivity(), 3000);
+
 // -- websocket --
 function connectWs(){
   const proto = location.protocol==="https:"?"wss":"ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/live`);
   ws.onmessage=(e)=>{
     const {channel, payload}=JSON.parse(e.data);
-    if(["reading","released","attempt_failed"].includes(channel)) loadDashboard();
+    if(["reading","released","attempt_failed"].includes(channel)) refreshDashboard();
     if(channel === "server_status") setBrokerChip(payload.connected);
-    if(channel === "connectivity") { loadConnectivity(); loadMeters(); loadZlans(); }
+    if(channel === "connectivity") { refreshConnectivity(); refreshMeters(); refreshZlans(); }
   };
   ws.onclose=()=>setTimeout(connectWs,1500);
 }
@@ -847,6 +865,8 @@ async function boot(){
     await loadQueue(); await loadHistory(); await loadConnectivity(); await loadOutput();
   });
   connectWs();
-  setInterval(loadDashboard, 4000); setInterval(loadMeters, 5000); setInterval(loadQueue, 4000);
+  const visible = fn => () => { if (!document.hidden) fn(); };       // no polling from a background tab
+  setInterval(visible(loadDashboard), 5000); setInterval(visible(loadMeters), 5000); setInterval(visible(loadQueue), 5000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) { loadDashboard(); loadMeters(); loadQueue(); } });
 }
 checkAuth();

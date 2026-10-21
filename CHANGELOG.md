@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.2.0
+**Output tab (connection settings) reworked**
+- Required fields are marked `*` and checked before saving, with a message under each wrong box (address typed as
+  `mqtt://...`, port out of range, a topic template with an unknown / unbalanced `{placeholder}`, a password without a
+  username, ...). Required fields are only enforced while **Enabled** is on, so a half-filled draft can still be saved.
+- **Save & check connection**: saves, then really connects and shows a step-by-step result: *Address* -> *Network* ->
+  *Login* -> *Response topic*, with timing and, when something fails, what to check (wrong password, broker needs a
+  login, port closed, no answer, topic not allowed ...). Nothing is published during the check.
+- **Test connection** button checks the values in the form without saving them. HTTP outputs are checked too.
+- The same rules are enforced on the server (`PUT /api/settings` answers 400 with the list of wrong fields);
+  new endpoint `POST /api/output/test`.
+- **Fixed: changing the MQTT username/password did not reconnect** (only a changed address or port did), so the broker
+  chip stayed red until a restart. Saving now reconnects immediately with the new settings.
+- **Fixed: a mistyped topic template** (e.g. `ksb/meter{meter_c`) raised an error while sending, which the poller
+  treated as a failing meter. The send now fails cleanly and logs why; the Output tab refuses such a template.
+
+**App-wide**
+- Loader: a slim progress bar at the top for every request you trigger, a blocking "working..." overlay for long
+  actions (saving/checking the connection, import, restart, resets, bulk upload) and while the page first loads.
+  Background refreshes stay silent. After a restart the overlay waits until the app answers and reloads the page.
+- If the login expires the page returns to the sign-in screen instead of filling with errors.
+- **Fixed: Sign out did not sign out** (the session cookie is HttpOnly, JavaScript cannot delete it). New
+  `POST /api/auth/logout`.
+
 ## 1.1.2
 **Fixed**
 - **Random HTTP 500 errors (and random "401 Unauthorized") in the web page**, e.g. `/api/dashboard` failing with

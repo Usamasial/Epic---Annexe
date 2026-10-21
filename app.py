@@ -7,7 +7,7 @@ Built directly against the finalized Scope of Work (12 sections).
 """
 import asyncio, base64, csv, hashlib, hmac, io, json, logging, os, re, secrets, signal, sys
 import queue as _queue_mod
-import shutil, sqlite3, struct, threading, time
+import ipaddress, shutil, socket, sqlite3, struct, threading, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,7 +24,7 @@ from typing import Optional, Dict, List
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 DB_PATH = Path("bridge.db")
 BACKUP_DIR = Path("backup")   # CSV copy of everything sent to IDMS (see BackupWriter)
 WEB_PORT = 8000
@@ -1093,7 +1093,7 @@ class Outbound:
         resp_topic = cfg.get("mqtt_response_topic","")
         username, password = cfg.get("mqtt_username",""), cfg.get("mqtt_password","")
         if not broker: return False
-        target = (broker, port)
+        target = (broker, port, username, password)   # a changed login must also trigger a reconnect
         if self.mqtt_client is None or self.mqtt_target != target:
             if self.mqtt_client:
                 try: self.mqtt_client.loop_stop(); self.mqtt_client.disconnect()
@@ -1124,6 +1124,22 @@ class Outbound:
             log.info("MQTT subscribe(%s) called, result=%s", resp_topic, result)
             self.mqtt_sub_topic = resp_topic
         return self.mqtt_client.is_connected()
+
+    def reconfigure(self):
+        """Called after the Output settings were saved: drop the live MQTT client so the next
+        connection uses the saved broker / login / topics, and reconnect right away."""
+        cfg = store.settings_dict()
+        with self.lock:
+            if self.mqtt_client is not None:
+                try: self.mqtt_client.loop_stop(); self.mqtt_client.disconnect()
+                except Exception: pass
+            self.mqtt_client = None; self.mqtt_target = None; self.mqtt_sub_topic = None
+            self.last_connected = None
+            with self.pending_lock: self.pending.clear()      # unanswered ones time out and are retried
+            if cfg.get("server_enabled") == "true" and cfg.get("connection_type") == "mqtt":
+                try: self._ensure_mqtt(cfg)
+                except Exception: log.exception("MQTT reconnect after settings change failed")
+        bus.publish("server_status", {"connected": bool(self.last_connected)})
 
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None):
         if reason_code == 0 or str(reason_code) == "Success":
@@ -1182,14 +1198,19 @@ class Outbound:
         if not self._ensure_mqtt(cfg):
             self.last_connected = False; bus.publish("server_status", {"connected": False})
             return "failed"
-        if topic_override:
-            topic = topic_override
-        elif topic_kind == "connectivity":
-            topic_tmpl = cfg.get("mqtt_connectivity_topic_template") or "ksb/connectivity/{entity_id}"
-            topic = topic_tmpl.format(entity_id=meter_code)
-        else:
-            topic_tmpl = cfg.get("mqtt_topic_template") or "ksb/meter{meter_code}/{label}"
-            topic = topic_tmpl.format(meter_code=self._topic_meter_id(meter_code), label=parameter_label)
+        try:
+            if topic_override:
+                topic = topic_override
+            elif topic_kind == "connectivity":
+                topic_tmpl = cfg.get("mqtt_connectivity_topic_template") or "ksb/connectivity/{entity_id}"
+                topic = topic_tmpl.format(entity_id=meter_code)
+            else:
+                topic_tmpl = cfg.get("mqtt_topic_template") or "ksb/meter{meter_code}/{label}"
+                topic = topic_tmpl.format(meter_code=self._topic_meter_id(meter_code), label=parameter_label)
+        except (KeyError, IndexError, ValueError):
+            # a mistyped placeholder must not look like a dead meter -- fail the send, say why
+            log.error("Invalid MQTT topic template -- fix it on the Output tab (placeholders: {meter_code} {label} {entity_id})")
+            return "failed"
         # Real server (Laravel) reads $msg->data->data->*, one level
         # deeper than HTTP mode uses -- MQTT-only wrapping.
         mqtt_payload = {"data": payload}
@@ -1508,6 +1529,205 @@ def broker_health_loop():
                 outbound._ensure_mqtt(cfg)
         time.sleep(10)
 
+# ==================================================================== OUTPUT CONNECTION: validation + connection test
+OUTPUT_KEYS = ("connection_type", "server_url", "mqtt_broker", "mqtt_port", "mqtt_username", "mqtt_password",
+               "mqtt_topic_template", "mqtt_response_topic", "mqtt_connectivity_topic_template",
+               "mqtt_response_timeout", "server_enabled")
+TEST_TIMEOUT = 8.0   # seconds the MQTT broker gets to answer a connection check
+_HOST_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*$")
+
+def _topic_template_error(tmpl, sample, allowed):
+    if not tmpl.strip(): return "Required."
+    if tmpl != tmpl.strip(): return "Remove the spaces at the start or end."
+    try:
+        topic = tmpl.format(**sample)
+    except KeyError as e:
+        return "Unknown placeholder {%s}. Allowed: %s." % (e.args[0], ", ".join("{%s}" % a for a in allowed))
+    except (IndexError, ValueError):
+        return "The { } braces do not match. Allowed placeholders: %s." % ", ".join("{%s}" % a for a in allowed)
+    if "+" in topic or "#" in topic: return "A publish topic cannot contain + or #."
+    return None
+
+def validate_output(cfg, need_all=False):
+    """Returns {setting_key: message}. Required fields are only enforced when the output is Enabled
+    (or need_all=True, used by the connection test); format rules always apply to whatever is filled in."""
+    errors = {}
+    ctype = (cfg.get("connection_type") or "http").strip()
+    need = need_all or cfg.get("server_enabled") == "true"
+    if ctype not in ("http", "mqtt"):
+        errors["connection_type"] = "Choose HTTP API or MQTT."
+        return errors
+    if ctype == "http":
+        url = (cfg.get("server_url") or "").strip()
+        if not url:
+            if need: errors["server_url"] = "Required."
+        elif not re.match(r"^https?://[^\s/]+\S*$", url):
+            errors["server_url"] = "Must start with http:// or https:// followed by the server address."
+        return errors
+    broker = (cfg.get("mqtt_broker") or "").strip()
+    if not broker:
+        if need: errors["mqtt_broker"] = "Required."
+    elif "://" in broker or "/" in broker or " " in broker:
+        errors["mqtt_broker"] = "Enter only the address (for example 103.224.93.124): no mqtt://, no path, no spaces."
+    else:
+        try:
+            ipaddress.ip_address(broker.strip("[]"))
+        except ValueError:
+            if broker.count(":") == 1:
+                errors["mqtt_broker"] = "Put the port in the Port box, not in the address."
+            elif not _HOST_RE.match(broker):
+                errors["mqtt_broker"] = "Not a valid IP address or host name."
+    port = str(cfg.get("mqtt_port") or "").strip()
+    if not port:
+        if need: errors["mqtt_port"] = "Required."
+    elif not port.isdigit() or not (1 <= int(port) <= 65535):
+        errors["mqtt_port"] = "Port must be a whole number from 1 to 65535 (usually 1883)."
+    if (cfg.get("mqtt_password") or "") and not (cfg.get("mqtt_username") or "").strip():
+        errors["mqtt_username"] = "Required when a password is entered."
+    t = cfg.get("mqtt_topic_template") or ""
+    if t.strip() or need:
+        e = _topic_template_error(t, {"meter_code": "1", "label": "kwh"}, ("meter_code", "label"))
+        if e: errors["mqtt_topic_template"] = e
+    t = cfg.get("mqtt_connectivity_topic_template") or ""
+    if t.strip() or need:
+        e = _topic_template_error(t, {"entity_id": "x"}, ("entity_id",))
+        if e: errors["mqtt_connectivity_topic_template"] = e
+    resp = cfg.get("mqtt_response_topic") or ""
+    if resp and resp != resp.strip():
+        errors["mqtt_response_topic"] = "Remove the spaces at the start or end."
+    timeout = str(cfg.get("mqtt_response_timeout") or "").strip()
+    if not timeout:
+        if need and resp.strip(): errors["mqtt_response_timeout"] = "Required when a response topic is set."
+    elif not timeout.isdigit() or not (1 <= int(timeout) <= 300):
+        errors["mqtt_response_timeout"] = "Seconds, from 1 to 300."
+    return errors
+
+def _net_error_text(e, host, port):
+    """(short problem, what to check) for a failed TCP connection."""
+    if isinstance(e, socket.gaierror):
+        return (f"Cannot find '{host}'.", "Check the address for typos (no mqtt:// prefix) and that this gateway has DNS / internet access.")
+    if isinstance(e, ConnectionRefusedError):
+        return (f"{host}:{port} refused the connection.", "Nothing is listening on that port: wrong port, or the broker is stopped.")
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return (f"No answer from {host}:{port} (timed out).", "Wrong IP address, or a firewall / the network is blocking port %s." % port)
+    if isinstance(e, OSError) and getattr(e, "errno", None) in (101, 113, 51, 65):
+        return (f"Cannot reach {host}:{port} (no route).", "Check this gateway's network connection and the IP address.")
+    return (f"Could not connect to {host}:{port}: {e}", "Check the address and port.")
+
+def test_mqtt_connection(cfg, timeout=None):
+    """Connects to the broker the way the bridge does (same login, same response topic) and reports each step.
+    Publishes nothing, uses its own client id, and does not touch the live connection."""
+    timeout = timeout or TEST_TIMEOUT
+    broker, port = cfg["mqtt_broker"].strip().strip("[]"), int(cfg["mqtt_port"])
+    user, pw = cfg.get("mqtt_username", ""), cfg.get("mqtt_password", "")
+    resp = (cfg.get("mqtt_response_topic") or "").strip()
+    checks, t0 = [], time.time()
+    def done(ok, message, hint=None):
+        return {"ok": ok, "checks": checks, "message": message, "hint": hint,
+                "latency_ms": int((time.time() - t0) * 1000), "target": f"{broker}:{port}"}
+    try:
+        socket.getaddrinfo(broker, port, type=socket.SOCK_STREAM)
+        checks.append({"name": "Address", "ok": True, "text": f"{broker} found"})
+    except OSError as e:
+        problem, hint = _net_error_text(e, broker, port)
+        checks.append({"name": "Address", "ok": False, "text": problem, "hint": hint})
+        return done(False, problem, hint)
+    connack, suback, state = threading.Event(), threading.Event(), {}
+    cid = f"bridge-test-{int(time.time() * 1000) % 10**9}"
+    client = (mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id=cid)
+              if hasattr(mqtt, "CallbackAPIVersion") else mqtt.Client(client_id=cid))
+    if user: client.username_pw_set(user, pw or None)
+    def on_connect(c, ud, flags, rc, props=None):
+        state["rc"], state["t"] = rc, time.time(); connack.set()
+    def on_subscribe(c, ud, mid, granted=None, *a):
+        state["granted"] = granted; suback.set()
+    client.on_connect, client.on_subscribe = on_connect, on_subscribe
+    try:
+        try:
+            client.connect(broker, port, keepalive=10)
+        except Exception as e:
+            problem, hint = _net_error_text(e, broker, port)
+            checks.append({"name": "Network", "ok": False, "text": problem, "hint": hint})
+            return done(False, problem, hint)
+        client.loop_start()
+        checks.append({"name": "Network", "ok": True, "text": f"Port {port} is open"})
+        if not connack.wait(timeout):
+            hint = "The port is open but it is not answering like an MQTT broker (wrong port?), or the broker is overloaded."
+            checks.append({"name": "Login", "ok": False, "text": f"The broker did not answer within {int(timeout)} s.", "hint": hint})
+            return done(False, "The broker did not answer.", hint)
+        rc = state["rc"]
+        failed = rc.is_failure if hasattr(rc, "is_failure") else (rc != 0)
+        if failed:
+            hint = ("Check the username and password, or ask the broker administrator to allow this user."
+                    if user else "This broker needs a username and password. Ask the broker administrator for them.")
+            text = f"The broker rejected the connection: {rc}."
+            checks.append({"name": "Login", "ok": False, "text": text, "hint": hint})
+            return done(False, text, hint)
+        checks.append({"name": "Login", "ok": True,
+                       "text": f"Logged in as {user}" if user else "Connected without a login (this broker allows anonymous clients)"})
+        if resp:
+            client.subscribe(resp, qos=1)
+            if not suback.wait(min(timeout, 5)):
+                checks.append({"name": "Response topic", "ok": False, "text": f"No answer when listening on {resp}.",
+                               "hint": "Delivery confirmations may not arrive. Check the topic name."})
+                return done(False, "Could not confirm the response topic.", "Check the response topic name.")
+            granted = state.get("granted") or []
+            denied = any((g.is_failure if hasattr(g, "is_failure") else (g is not None and int(g) >= 128)) for g in granted)
+            if denied:
+                hint = "IDMS delivery confirmations will not arrive. Ask the broker administrator to allow this user to subscribe to that topic."
+                checks.append({"name": "Response topic", "ok": False, "text": f"The broker does not allow listening on {resp}.", "hint": hint})
+                return done(False, "Not allowed to listen on the response topic.", hint)
+            checks.append({"name": "Response topic", "ok": True, "text": f"Allowed to listen on {resp}"})
+        else:
+            checks.append({"name": "Response topic", "ok": True,
+                           "text": "No response topic set: a message counts as delivered once the broker accepts it"})
+        res = done(True, f"Connected to {broker}:{port}")
+        res["latency_ms"] = int((state["t"] - t0) * 1000)
+        return res
+    finally:
+        try: client.disconnect()
+        except Exception: pass
+        try: client.loop_stop()
+        except Exception: pass
+
+def test_http_connection(cfg):
+    url = cfg["server_url"].strip()
+    checks, t0 = [], time.time()
+    def done(ok, message, hint=None):
+        return {"ok": ok, "checks": checks, "message": message, "hint": hint,
+                "latency_ms": int((time.time() - t0) * 1000), "target": url}
+    try:
+        r = requests.request("HEAD", url, timeout=5, allow_redirects=False)
+    except requests.exceptions.SSLError:
+        t, h = "The secure (https) connection failed.", "The server's certificate is not trusted by this gateway, or the address should start with http://."
+    except requests.exceptions.Timeout:
+        t, h = "No answer from the server (timed out).", "Wrong address, or a firewall / the network is blocking it."
+    except requests.exceptions.ConnectionError as e:
+        txt = str(e)
+        if "Name or service not known" in txt or "Temporary failure in name resolution" in txt or "nodename nor servname" in txt:
+            t, h = "Cannot find that server name.", "Check the address for typos and that this gateway has DNS / internet access."
+        elif "refused" in txt.lower():
+            t, h = "The server refused the connection.", "Nothing is listening on that port: wrong port, or the server is stopped."
+        else:
+            t, h = "Could not connect to the server.", "Check the address and the gateway's network connection."
+    except requests.exceptions.RequestException as e:
+        t, h = f"The request failed: {e}", "Check the URL."
+    else:
+        code = r.status_code
+        if code == 404:
+            checks.append({"name": "Server", "ok": False, "text": "The server answered, but this URL returns 404 (Not Found).",
+                           "hint": "Check the path at the end of the URL."})
+            return done(False, "URL not found (404).", "Check the path at the end of the URL.")
+        if code >= 500:
+            checks.append({"name": "Server", "ok": False, "text": f"The server answered with an error (HTTP {code}).",
+                           "hint": "The server is reachable but failing; ask the IDMS developer."})
+            return done(False, f"Server error (HTTP {code}).", "Ask the IDMS developer.")
+        extra = " It asks for authentication." if code in (401, 403) else ""
+        checks.append({"name": "Server", "ok": True, "text": f"Server answered (HTTP {code}).{extra}"})
+        return done(True, f"Server reachable (HTTP {code}).")
+    checks.append({"name": "Server", "ok": False, "text": t, "hint": h})
+    return done(False, t, h)
+
 # ==================================================================== AUTH (Sec 10)
 def _hash_pw(password, salt):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
@@ -1538,7 +1758,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Modbus Bridge", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-_PUBLIC_PATHS = {"/", "/api/auth/status", "/api/auth/login", "/api/auth/setup"}
+_PUBLIC_PATHS = {"/", "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"}
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -1586,6 +1806,12 @@ def auth_login(payload: dict = Body(...), response: Response = None):
         return bad("Invalid credentials.", 401)
     token = _sign(store.get("auth_user"))
     response.set_cookie("session", token, httponly=True, max_age=3650*86400)
+    return {"ok": True}
+
+@app.post("/api/auth/logout")
+def auth_logout(response: Response):
+    # the session cookie is HttpOnly, so only the server can clear it (JavaScript cannot)
+    response.delete_cookie("session")
     return {"ok": True}
 
 @app.post("/api/auth/change-password")
@@ -1906,10 +2132,32 @@ def api_settings():
 
 @app.put("/api/settings")
 def api_set_settings(payload: dict = Body(...)):
-    for k, v in payload.items():
-        if k in DEFAULT_SETTINGS and k not in ("auth_hash","auth_salt"):
-            store.set(k, v)
+    accepted = {k: v for k, v in payload.items() if k in DEFAULT_SETTINGS and k not in ("auth_hash", "auth_salt")}
+    touches_output = any(k in OUTPUT_KEYS for k in accepted)
+    if touches_output:
+        merged = store.settings_dict()
+        merged.update({k: ("" if v is None else str(v)) for k, v in accepted.items()})
+        errors = validate_output(merged)
+        if errors:
+            return JSONResponse(status_code=400, content={"detail": "Please fix the highlighted fields.", "errors": errors})
+    for k, v in accepted.items():
+        store.set(k, v)
+    if touches_output:
+        threading.Thread(target=outbound.reconfigure, daemon=True).start()   # reconnect with the new settings now
     return {"ok": True}
+
+@app.post("/api/output/test")
+def api_output_test(payload: dict = Body(default={})):
+    """Checks the output connection with the values in the form (saved or not) without sending any data."""
+    cfg = store.settings_dict()
+    for k in OUTPUT_KEYS:
+        if k in payload: cfg[k] = "" if payload[k] is None else str(payload[k])
+    errors = validate_output(cfg, need_all=True)
+    if errors:
+        return JSONResponse(status_code=400, content={"detail": "Please fix the highlighted fields.", "errors": errors})
+    res = test_http_connection(cfg) if (cfg.get("connection_type") or "http") == "http" else test_mqtt_connection(cfg)
+    res["type"] = cfg.get("connection_type") or "http"
+    return res
 
 @app.get("/api/version")
 def api_version(): return {"version": APP_VERSION}

@@ -1,3 +1,71 @@
+// ===== Global loader =========================================================================
+// * a slim animated bar at the top for every request the USER triggers (saves, deletes, tab loads);
+//   the automatic background refreshes (dashboard, meters, queue ...) stay silent
+// * a blocking overlay with a message for long actions: busy.show("...") / busy.hide() / withBusy()
+// * if the login expires (HTTP 401) the page goes back to the sign-in screen instead of filling with errors
+(function () {
+  const QUIET_GET = [/^\/api\/dashboard/, /^\/api\/meters/, /^\/api\/queue/, /^\/api\/zlans/, /^\/api\/connectivity-history/,
+                     /^\/api\/auth\/status/, /^\/api\/backup\/status/];
+  let loud = 0, showTimer = null, hideTimer = null, shownAt = 0;
+  const bar = () => document.getElementById("top-progress");
+  function start() {
+    loud++;
+    if (loud === 1) {
+      clearTimeout(hideTimer);
+      showTimer = setTimeout(() => { const b = bar(); if (b) { b.classList.add("on"); shownAt = Date.now(); } }, 200);   // fast requests never flash
+    }
+  }
+  function stop() {
+    loud = Math.max(0, loud - 1);
+    if (loud === 0) {
+      clearTimeout(showTimer);
+      const wait = shownAt ? Math.max(0, 450 - (Date.now() - shownAt)) : 0;
+      hideTimer = setTimeout(() => { const b = bar(); if (b) b.classList.remove("on"); shownAt = 0; }, wait);
+    }
+  }
+  function sessionExpired() {
+    try {
+      const last = Number(sessionStorage.getItem("reloaded401") || 0);
+      if (Date.now() - last < 30000) return;            // never loop
+      sessionStorage.setItem("reloaded401", String(Date.now()));
+    } catch (e) {}
+    location.reload();                                  // checkAuth() then shows the sign-in screen
+  }
+  const orig = window.fetch.bind(window);
+  window.fetch = async function (input, init) {
+    const url = typeof input === "string" ? input : input.url;
+    const method = ((init && init.method) || "GET").toUpperCase();
+    const path = url.replace(location.origin, "");
+    const quiet = method === "GET" && QUIET_GET.some(re => re.test(path));
+    if (!quiet) start();
+    try {
+      const r = await orig(input, init);
+      if (r.status === 401 && !path.startsWith("/api/auth/")) sessionExpired();
+      return r;
+    } finally { if (!quiet) stop(); }
+  };
+
+  let overlayTimer = null, overlayDepth = 0;
+  window.busy = {
+    show(text, delay) {
+      overlayDepth++;
+      const ov = document.getElementById("busy-overlay");
+      if (text) document.getElementById("busy-text").textContent = text;
+      clearTimeout(overlayTimer);
+      overlayTimer = setTimeout(() => { if (ov) ov.hidden = false; }, delay == null ? 150 : delay);   // short actions never flash an overlay
+    },
+    text(t) { const el = document.getElementById("busy-text"); if (el) el.textContent = t; },
+    hide() {
+      overlayDepth = Math.max(0, overlayDepth - 1);
+      if (overlayDepth === 0) { clearTimeout(overlayTimer); const ov = document.getElementById("busy-overlay"); if (ov) ov.hidden = true; }
+    },
+  };
+  window.withBusy = async function (text, fn) {
+    busy.show(text);
+    try { return await fn(); } finally { busy.hide(); }
+  };
+})();
+
 // -- auth --
 async function checkAuth() {
   const r = await fetch("/api/auth/status");
@@ -17,7 +85,10 @@ document.getElementById("btn-login").addEventListener("click", async () => {
     const d = await r.json(); document.getElementById("login-msg").textContent = d.detail || "Failed";
   }
 });
-document.getElementById("btn-logout").addEventListener("click", () => { document.cookie="session=;max-age=0"; location.reload(); });
+document.getElementById("btn-logout").addEventListener("click", async () => {
+  try { await fetch("/api/auth/logout", {method:"POST"}); } catch (e) {}      // server clears the HttpOnly session cookie
+  location.reload();
+});
 
 function showApp() {
   document.getElementById("login-screen").style.display = "none";
@@ -108,7 +179,7 @@ document.getElementById("btn-bulk-upload").addEventListener("click", async () =>
     const row = {}; headers.forEach((h,i)=>row[h]=vals[i]?.trim());
     return row;
   });
-  const r = await fetch("/api/meters/bulk-upload",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows})});
+  const r = await withBusy("Uploading meters\u2026", () => fetch("/api/meters/bulk-upload",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows})}));
   const d = await r.json();
   alert(`Created: ${d.created.length}. Errors: ${d.errors.length}`);
   await loadZlans(); await loadMeters();
@@ -496,16 +567,167 @@ async function loadOutput() {
   loadBackupStatus();
   toggleConnFields();
 }
-document.getElementById("btn-save-output").addEventListener("click", async () => {
-  const body = {connection_type: document.getElementById("conn-type").value, server_url: document.getElementById("out-url").value,
-    mqtt_broker: document.getElementById("mqtt-broker").value, mqtt_port: document.getElementById("mqtt-port").value,
-    mqtt_username: document.getElementById("mqtt-username").value, mqtt_password: document.getElementById("mqtt-password").value,
-    mqtt_topic_template: document.getElementById("mqtt-topic-tmpl").value, mqtt_response_topic: document.getElementById("mqtt-resp-topic").value,
-    mqtt_connectivity_topic_template: document.getElementById("mqtt-conn-topic-tmpl").value,
-    mqtt_response_timeout: document.getElementById("mqtt-resp-timeout").value, server_enabled: document.getElementById("out-enabled").checked?"true":"false"};
-  await fetch("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  const msg=document.getElementById("output-msg"); msg.textContent="Saved."; msg.className="msg success";
+// ===== Output connection: validation, save, connection check =================================
+const OUT = {   // setting key -> input id
+  connection_type: "conn-type", server_url: "out-url", mqtt_broker: "mqtt-broker", mqtt_port: "mqtt-port",
+  mqtt_username: "mqtt-username", mqtt_password: "mqtt-password", mqtt_topic_template: "mqtt-topic-tmpl",
+  mqtt_response_topic: "mqtt-resp-topic", mqtt_response_timeout: "mqtt-resp-timeout",
+  mqtt_connectivity_topic_template: "mqtt-conn-topic-tmpl",
+};
+const $ = id => document.getElementById(id);
+function readOutput() {
+  const v = {};
+  for (const [k, id] of Object.entries(OUT)) v[k] = $(id).value.trim();
+  v.mqtt_password = $("mqtt-password").value;                       // passwords may contain spaces
+  v.server_enabled = $("out-enabled").checked ? "true" : "false";
+  return v;
+}
+function templateError(t, allowed) {                                // same rules as the server
+  if (!t) return "Required.";
+  const rest = t.replace(/\{(\w+)\}/g, (m, name) => allowed.includes(name) ? "" : "\u0000" + name);
+  const bad = rest.match(/\u0000(\w+)/);
+  if (bad) return "Unknown placeholder {" + bad[1] + "}. Allowed: " + allowed.map(a => "{" + a + "}").join(", ") + ".";
+  if (/[{}]/.test(rest)) return "The { } braces do not match. Allowed placeholders: " + allowed.map(a => "{" + a + "}").join(", ") + ".";
+  if (/[+#]/.test(t)) return "A publish topic cannot contain + or #.";
+  return null;
+}
+function validateOutput(v, needAll) {                               // quick checks before asking the server
+  const e = {}, need = needAll || v.server_enabled === "true";
+  if (v.connection_type === "http") {
+    if (!v.server_url) { if (need) e.server_url = "Required."; }
+    else if (!/^https?:\/\/[^\s/]+\S*$/.test(v.server_url)) e.server_url = "Must start with http:// or https:// followed by the server address.";
+    return e;
+  }
+  if (!v.mqtt_broker) { if (need) e.mqtt_broker = "Required."; }
+  else if (/:\/\/|\/|\s/.test(v.mqtt_broker)) e.mqtt_broker = "Enter only the address (for example 103.224.93.124): no mqtt://, no path, no spaces.";
+  else if ((v.mqtt_broker.match(/:/g) || []).length === 1) e.mqtt_broker = "Put the port in the Port box, not in the address.";
+  if (!v.mqtt_port) { if (need) e.mqtt_port = "Required."; }
+  else if (!/^\d+$/.test(v.mqtt_port) || +v.mqtt_port < 1 || +v.mqtt_port > 65535) e.mqtt_port = "Port must be a whole number from 1 to 65535 (usually 1883).";
+  if (v.mqtt_password && !v.mqtt_username) e.mqtt_username = "Required when a password is entered.";
+  if (v.mqtt_topic_template || need) { const m = templateError(v.mqtt_topic_template, ["meter_code", "label"]); if (m) e.mqtt_topic_template = m; }
+  if (v.mqtt_connectivity_topic_template || need) { const m = templateError(v.mqtt_connectivity_topic_template, ["entity_id"]); if (m) e.mqtt_connectivity_topic_template = m; }
+  if (!v.mqtt_response_timeout) { if (need && v.mqtt_response_topic) e.mqtt_response_timeout = "Required when a response topic is set."; }
+  else if (!/^\d+$/.test(v.mqtt_response_timeout) || +v.mqtt_response_timeout < 1 || +v.mqtt_response_timeout > 300) e.mqtt_response_timeout = "Seconds, from 1 to 300.";
+  return e;
+}
+function clearOutputErrors() {
+  for (const [k, id] of Object.entries(OUT)) {
+    $(id).classList.remove("invalid");
+    const el = $("err-" + k); if (el) el.textContent = "";
+  }
+}
+function showOutputErrors(errors) {
+  clearOutputErrors();
+  let first = null;
+  for (const [k, msg] of Object.entries(errors)) {
+    const id = OUT[k]; if (!id) continue;
+    $(id).classList.add("invalid");
+    const el = $("err-" + k); if (el) el.textContent = msg;
+    if (!first) first = $(id);
+  }
+  if (first) { first.scrollIntoView({block: "center", behavior: "smooth"}); first.focus({preventScroll: true}); }
+}
+document.querySelectorAll("#panel-output input, #panel-output select").forEach(el => {
+  el.addEventListener("input", () => {                                // an error disappears as soon as the box is edited
+    el.classList.remove("invalid");
+    const k = Object.keys(OUT).find(key => OUT[key] === el.id); if (k && $("err-" + k)) $("err-" + k).textContent = "";
+  });
 });
+$("mqtt-show-pw").addEventListener("change", e => { $("mqtt-password").type = e.target.checked ? "text" : "password"; });
+
+// status panel: banner + one line per check (built with textContent: host names come from the user)
+function renderStatus(state, title, lines) {
+  const box = $("output-status"); box.hidden = false; box.replaceChildren();
+  const banner = document.createElement("div"); banner.className = "conn-banner " + state;
+  if (state === "run") { const sp = document.createElement("div"); sp.className = "spinner small"; banner.append(sp); }
+  else banner.append(Object.assign(document.createElement("span"), {textContent: state === "ok" ? "✓" : state === "warn" ? "!" : "✗"}));
+  banner.append(Object.assign(document.createElement("span"), {textContent: title}));
+  box.append(banner);
+  if (lines && lines.length) {
+    const ul = document.createElement("ul"); ul.className = "conn-checks";
+    for (const l of lines) {
+      const li = document.createElement("li"); li.className = l.state;
+      const ic = document.createElement("span"); ic.className = "ic";
+      if (l.state === "run") { const sp = document.createElement("div"); sp.className = "spinner small"; ic.append(sp); }
+      else ic.textContent = l.state === "ok" ? "✓" : "✗";
+      const body = document.createElement("div");
+      if (l.name) body.append(Object.assign(document.createElement("b"), {textContent: l.name + " "}));
+      body.append(document.createTextNode(l.text));
+      if (l.hint) body.append(Object.assign(document.createElement("small"), {textContent: l.hint}));
+      li.append(ic, body);
+      if (l.meta) li.append(Object.assign(document.createElement("span"), {className: "meta", textContent: l.meta}));
+      ul.append(li);
+    }
+    box.append(ul);
+  }
+}
+function targetOf(v) { return v.connection_type === "mqtt" ? `${v.mqtt_broker}:${v.mqtt_port}` : v.server_url; }
+function checkLines(res) {
+  return res.checks.map((c, i) => ({state: c.ok ? "ok" : "bad", name: c.name, text: c.text, hint: c.hint,
+                                    meta: (i === 1 && c.ok && res.latency_ms != null) ? res.latency_ms + " ms" : ""}));
+}
+async function apiJson(url, method, body) {
+  try {
+    const r = await fetch(url, {method, headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    let data = null; try { data = await r.json(); } catch (e) {}
+    return {ok: r.ok, status: r.status, data};
+  } catch (e) { return {ok: false, status: 0, data: {detail: "Cannot reach the gateway (network error)."}}; }
+}
+
+let outputBusy = false;
+async function outputFlow(save) {
+  if (outputBusy) return;
+  const v = readOutput();
+  clearOutputErrors();
+  // saving a half-filled form is fine while the output is switched off; a connection test always needs the full set
+  const errs = validateOutput(v, !save);
+  if (Object.keys(errs).length) {
+    showOutputErrors(errs);
+    renderStatus("bad", "Please fix the highlighted fields" + (save ? " — nothing was saved." : "."), []);
+    return;
+  }
+  outputBusy = true; $("btn-save-output").disabled = true; $("btn-test-output").disabled = true;
+  const done = [];
+  try {
+    busy.show(save ? "Saving connection settings…" : `Checking connection to ${targetOf(v)}…`);   // one show, one hide (in finally)
+    if (save) {
+      renderStatus("run", "Saving settings…", []);
+      const r = await apiJson("/api/settings", "PUT", v);
+      if (!r.ok) {
+        if (r.data && r.data.errors) showOutputErrors(r.data.errors);
+        renderStatus("bad", "Not saved: " + ((r.data && r.data.detail) || "unexpected error"), []);
+        return;
+      }
+      done.push({state: "ok", text: "Settings saved"});
+    }
+    const complete = Object.keys(validateOutput(v, true)).length === 0;
+    if (save && !complete) {                                   // a draft: nothing to connect to yet
+      renderStatus("warn", "Saved. The connection was not checked because some fields are still empty.", done);
+      return;
+    }
+    busy.text(`Checking connection to ${targetOf(v)}…`);
+    renderStatus("run", `Checking connection to ${targetOf(v)}…`, done.concat([{state: "run", text: "Contacting the server…"}]));
+    const t = await apiJson("/api/output/test", "POST", v);
+    if (!t.ok) {
+      if (t.data && t.data.errors) showOutputErrors(t.data.errors);
+      renderStatus("bad", (save ? "Saved, but the connection check could not run: " : "Connection check could not run: ") + ((t.data && t.data.detail) || "error"), done);
+      return;
+    }
+    const res = t.data, lines = done.concat(checkLines(res));
+    if (res.ok) {
+      const off = save && v.server_enabled !== "true";
+      renderStatus(off ? "warn" : "ok",
+        (save ? "Saved and connected" : "Connection works") + ` — ${res.target}` + (off ? ". The output is switched OFF, so nothing is being sent yet." : "."), lines);
+    } else {
+      renderStatus("bad", (save ? "Saved, but the connection check failed. " : "Connection check failed. ") + res.message, lines);
+    }
+    if (save) { setTimeout(loadDashboard, 1500); setTimeout(loadDashboard, 4500); }       // refresh the broker chip once it reconnected
+  } finally {
+    busy.hide(); outputBusy = false; $("btn-save-output").disabled = false; $("btn-test-output").disabled = false;
+  }
+}
+$("btn-save-output").addEventListener("click", () => outputFlow(true));
+$("btn-test-output").addEventListener("click", () => outputFlow(false));
 document.getElementById("btn-save-settings").addEventListener("click", async () => {
   const body = {max_attempts: document.getElementById("set-max-attempts").value, max_queue_size: document.getElementById("set-max-queue").value,
     queue_retention_days: document.getElementById("set-queue-retention").value};
@@ -564,7 +786,7 @@ document.getElementById("btn-import-config").addEventListener("click", () => doc
 document.getElementById("import-file").addEventListener("change", async (e) => {
   const file = e.target.files[0]; if(!file) return;
   const text = await file.text();
-  await fetch("/api/config/import",{method:"POST",headers:{"Content-Type":"application/json"},body:text});
+  await withBusy("Importing configuration\u2026", () => fetch("/api/config/import",{method:"POST",headers:{"Content-Type":"application/json"},body:text}));
   alert("Configuration imported."); location.reload();
 });
 document.getElementById("btn-change-pw").addEventListener("click", async () => {
@@ -574,14 +796,25 @@ document.getElementById("btn-change-pw").addEventListener("click", async () => {
   msg.textContent = r.ok ? "Password updated." : (d.detail||"Failed"); msg.className = r.ok?"msg success":"msg error";
 });
 
+// after a restart: keep the overlay up until the app answers again, then reload the page
+function waitForApp(text) {
+  busy.show(text + " This page reloads by itself.", 0);
+  const started = Date.now();
+  const tick = async () => {
+    try { const r = await fetch("/api/auth/status", {cache: "no-store"}); if (r.ok && Date.now() - started > 3000) { location.reload(); return; } } catch (e) {}
+    if (Date.now() - started > 90000) { busy.text("The app is taking long to come back. Reload this page manually."); return; }
+    setTimeout(tick, 2000);
+  };
+  setTimeout(tick, 2500);
+}
 async function restartApp(){
   if (!confirm("Restart the app process now? The dashboard will briefly disconnect and come back automatically.")) return;
-  await fetch("/api/system/restart",{method:"POST"});
-  alert("Restarting... reload this page in a few seconds.");
+  await withBusy("Restarting the app\u2026", () => fetch("/api/system/restart",{method:"POST"}));
+  waitForApp("Restarting the app\u2026");
 }
 async function resetSettingsOnly(){
   if (!confirm("Reset all settings to their defaults? Your ZLANs, meters, and history are not affected.")) return;
-  await fetch("/api/settings/reset",{method:"POST"});
+  await withBusy("Resetting settings\u2026", () => fetch("/api/settings/reset",{method:"POST"}));
   alert("Settings reset to defaults.");
   await loadOutput();
   location.reload();
@@ -590,9 +823,9 @@ async function factoryReset(){
   if (!confirm("This will PERMANENTLY DELETE everything -- ZLANs, meters, parameters, all history, and settings, including your login. Continue?")) return;
   const password = prompt("Re-enter your current password to confirm factory reset:");
   if (!password) return;
-  const r = await fetch("/api/system/factory-reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})});
+  const r = await withBusy("Resetting everything\u2026", () => fetch("/api/system/factory-reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})}));
   if (!r.ok) { const d = await r.json(); alert(d.detail || "Failed."); return; }
-  alert("Factory reset complete. The app is restarting -- reload this page in a few seconds.");
+  waitForApp("Factory reset complete. The app is restarting\u2026");
 }
 
 // -- websocket --
@@ -609,8 +842,10 @@ function connectWs(){
 }
 
 async function boot(){
-  await loadDashboard(); await loadZlans(); await loadMeters(); await loadParams();
-  await loadQueue(); await loadHistory(); await loadConnectivity(); await loadOutput();
+  await withBusy("Loading\u2026", async () => {
+    await loadDashboard(); await loadZlans(); await loadMeters(); await loadParams();
+    await loadQueue(); await loadHistory(); await loadConnectivity(); await loadOutput();
+  });
   connectWs();
   setInterval(loadDashboard, 4000); setInterval(loadMeters, 5000); setInterval(loadQueue, 4000);
 }

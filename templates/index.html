@@ -9,6 +9,10 @@
 <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
+<div id="top-progress" aria-hidden="true"></div>
+<div id="busy-overlay" role="status" aria-live="polite" hidden>
+  <div class="busy-card"><div class="spinner" aria-hidden="true"></div><div id="busy-text">Working&hellip;</div></div>
+</div>
 
 <div id="login-screen" class="login-wrap">
   <div class="login-card">
@@ -204,28 +208,54 @@
     <section class="panel" id="panel-output">
       <section class="card">
         <div class="card-head"><h2>Output connection</h2></div>
-        <div class="add-form"><label>Type<select id="conn-type"><option value="http">HTTP API</option><option value="mqtt">MQTT</option></select></label></div>
-        <div id="http-fields" class="add-form"><label style="flex:1">URL<input type="text" id="out-url" style="width:100%"></label></div>
+        <p class="msg">Where this gateway sends its readings. Fields marked <span class="req">*</span> are required when <b>Enabled</b> is on.
+          <b>Save</b> stores the settings and then checks the connection; <b>Test connection</b> only checks it, without saving.</p>
+        <div class="add-form">
+          <label><span class="lbl">Type <span class="req">*</span></span><select id="conn-type"><option value="http">HTTP API</option><option value="mqtt">MQTT</option></select>
+            <small class="field-error" id="err-connection_type"></small></label>
+        </div>
+        <div id="http-fields" class="add-form">
+          <label style="flex:1"><span class="lbl">URL <span class="req">*</span></span><input type="text" id="out-url" style="width:100%" placeholder="https://idms.example.com/api/readings" autocomplete="off">
+            <small class="hint">Full address that receives the readings, starting with http:// or https://</small>
+            <small class="field-error" id="err-server_url"></small></label>
+        </div>
         <div id="mqtt-fields" style="display:none;">
           <div class="add-form">
-            <label>Broker<input type="text" id="mqtt-broker"></label>
-            <label>Port<input type="number" id="mqtt-port"></label>
-            <label>Topic template<input type="text" id="mqtt-topic-tmpl"></label>
+            <label><span class="lbl">Broker address <span class="req">*</span></span><input type="text" id="mqtt-broker" placeholder="103.224.93.124" autocomplete="off">
+              <small class="hint">IP address or host name only</small><small class="field-error" id="err-mqtt_broker"></small></label>
+            <label><span class="lbl">Port <span class="req">*</span></span><input type="number" id="mqtt-port" placeholder="1883" min="1" max="65535">
+              <small class="hint">Usually 1883</small><small class="field-error" id="err-mqtt_port"></small></label>
           </div>
           <div class="add-form">
-            <label>Username (optional)<input type="text" id="mqtt-username"></label>
-            <label>Password (optional)<input type="password" id="mqtt-password"></label>
+            <label><span class="lbl">Username <span class="opt">optional</span></span><input type="text" id="mqtt-username" autocomplete="off">
+              <small class="hint">Given by the broker administrator</small><small class="field-error" id="err-mqtt_username"></small></label>
+            <label><span class="lbl">Password <span class="opt">optional</span></span><input type="password" id="mqtt-password" autocomplete="new-password">
+              <small class="hint"><label class="inline-check"><input type="checkbox" id="mqtt-show-pw"> Show password</label></small>
+              <small class="field-error" id="err-mqtt_password"></small></label>
           </div>
           <div class="add-form">
-            <label>Response topic<input type="text" id="mqtt-resp-topic"></label>
-            <label>Response timeout (s)<input type="number" id="mqtt-resp-timeout"></label>
+            <label style="flex:1;min-width:280px"><span class="lbl">Topic template <span class="req">*</span></span><input type="text" id="mqtt-topic-tmpl" style="width:100%" placeholder="ksb/meter{meter_code}/{label}" autocomplete="off">
+              <small class="hint">Topic each reading is published to. Placeholders: {meter_code} {label}</small>
+              <small class="field-error" id="err-mqtt_topic_template"></small></label>
           </div>
           <div class="add-form">
-            <label style="flex:1">Connectivity topic template<input type="text" id="mqtt-conn-topic-tmpl" style="width:100%" placeholder="ksb/connectivity/{entity_id}"></label>
+            <label style="flex:1;min-width:280px"><span class="lbl">Response topic <span class="opt">optional</span></span><input type="text" id="mqtt-resp-topic" style="width:100%" placeholder="ksb/server/response/idms" autocomplete="off">
+              <small class="hint">Where IDMS sends delivery confirmations. Empty = a message counts as delivered once the broker accepts it.</small>
+              <small class="field-error" id="err-mqtt_response_topic"></small></label>
+            <label>Response timeout (s)<input type="number" id="mqtt-resp-timeout" placeholder="15" min="1" max="300">
+              <small class="hint">How long to wait for a confirmation</small><small class="field-error" id="err-mqtt_response_timeout"></small></label>
+          </div>
+          <div class="add-form">
+            <label style="flex:1;min-width:280px"><span class="lbl">Connectivity topic template <span class="req">*</span></span><input type="text" id="mqtt-conn-topic-tmpl" style="width:100%" placeholder="ksb/connectivity/{entity_id}" autocomplete="off">
+              <small class="hint">Placeholder: {entity_id}</small><small class="field-error" id="err-mqtt_connectivity_topic_template"></small></label>
           </div>
         </div>
         <label class="switch-row"><input type="checkbox" id="out-enabled"><span class="slider"></span><span>Enabled</span></label>
-        <div class="card-actions"><button class="btn-primary" id="btn-save-output">Save</button><span class="msg" id="output-msg"></span></div>
+        <div class="card-actions">
+          <button class="btn-primary" id="btn-save-output">Save &amp; check connection</button>
+          <button class="btn-ghost" id="btn-test-output">Test connection</button>
+        </div>
+        <div id="output-status" class="conn-status" hidden aria-live="polite"></div>
       </section>
     </section>
 

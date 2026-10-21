@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.2
+**Fixed**
+- **Random HTTP 500 errors (and random "401 Unauthorized") in the web page**, e.g. `/api/dashboard` failing with
+  `'NoneType' object is not subscriptable`. All threads (web requests, ZLAN pollers, retry loop) share one database
+  connection; a query was started under a lock but its result was read after the lock was released, so another
+  thread could invalidate it first. Results are now read completely while the lock is held. This bug existed in v1.0;
+  it shows up much more on Python 3.13 (Debian 13 gateways). Under a 20 s load test the old code gave hundreds of
+  errors, the fixed code none.
+- A change made to `bridge.db` by another process (for example clearing the login from the command line) is now seen
+  by the running app immediately, instead of only after a restart.
+
 ## 1.1.1
 **Fixed**
 - ZLAN / Meter / Parameter tables lost whatever you had typed (and sometimes the value you were about to save):

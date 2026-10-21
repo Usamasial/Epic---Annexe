@@ -24,7 +24,7 @@ from typing import Optional, Dict, List
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 DB_PATH = Path("bridge.db")
 BACKUP_DIR = Path("backup")   # CSV copy of everything sent to IDMS (see BackupWriter)
 WEB_PORT = 8000
@@ -277,6 +277,22 @@ class BackupWriter:
             except OSError: pass
         return n
 
+class _Rows:
+    """In-memory result of a query: same fetchone / fetchall / rowcount / iteration
+    interface the callers already use, but safe to read from any thread."""
+    __slots__ = ("_rows", "_i", "rowcount", "lastrowid")
+    def __init__(self, rows, rowcount, lastrowid):
+        self._rows, self._i, self.rowcount, self.lastrowid = rows, 0, rowcount, lastrowid
+    def fetchone(self):
+        if self._i >= len(self._rows): return None
+        self._i += 1
+        return self._rows[self._i - 1]
+    def fetchall(self):
+        out = self._rows[self._i:]; self._i = len(self._rows)
+        return out
+    def __iter__(self):
+        return iter(self.fetchall())
+
 class Store:
     def __init__(self, path: Path):
         self.lock = threading.RLock()  # RLock, not Lock: several methods call other
@@ -344,7 +360,17 @@ class Store:
         undefined behavior in Python's sqlite3 module and was silently
         corrupting/hanging the shared connection under real production load."""
         with self.lock:
-            return self.c.execute(sql, params)
+            cur = self.c.execute(sql, params)
+            # Read the WHOLE result while still holding the lock, then release the
+            # statement. Handing the live cursor back let another thread's query on
+            # the same connection invalidate it before the caller read it
+            # (fetchone() -> None / wrong row => HTTP 500 on /api/dashboard on
+            # Python 3.13), and left read snapshots open so other processes' edits
+            # to bridge.db stayed invisible to the running app.
+            rows = cur.fetchall() if cur.description is not None else []
+            res = _Rows(rows, cur.rowcount, cur.lastrowid)
+            cur.close()
+            return res
 
     def get(self, k):
         r = self._q("SELECT value FROM settings WHERE key=?", (k,)).fetchone()

@@ -25,7 +25,7 @@ from typing import Optional, Dict, List
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 DB_PATH = Path("bridge.db")
 BACKUP_DIR = Path("backup")   # CSV copy of everything sent to IDMS (see BackupWriter)
 WEB_PORT = 8000
@@ -1813,7 +1813,15 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Modbus Bridge", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+class RevalidatingStatic(StaticFiles):
+    """Browsers must re-check the page scripts with the server every time (a cheap 304 when unchanged).
+    Without this a browser could keep running an old app.js against a new index.html after an update."""
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+app.mount("/static", RevalidatingStatic(directory="static"), name="static")
 
 _PUBLIC_PATHS = {"/", "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"}
 
@@ -1837,7 +1845,10 @@ def bad(msg, code=400): return JSONResponse(status_code=code, content={"detail":
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return open("templates/index.html").read()
+    html = open("templates/index.html").read()
+    for name in ("style.css", "app.js"):        # the URL changes with every release, so old copies are never reused
+        html = html.replace(f'/static/{name}"', f'/static/{name}?v={APP_VERSION}"')
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 # -- auth --
 @app.get("/api/auth/status")

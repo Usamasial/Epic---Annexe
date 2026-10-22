@@ -111,3 +111,16 @@ def test_blank_zlan_poll_interval_is_rejected_but_publish_blank_clears_it(client
     assert client.put("/api/zlans/192.168.50.155/publish-interval", json={"default_publish_interval": ""}).status_code == 200
     assert site.store.list_zlans()[0]["default_publish_interval"] is None
     assert client.put("/api/meters/M090/interval", json={"polling_interval": None}).status_code == 200
+
+
+# ---- a browser must never run an old app.js against a new page ------------------------------------
+def test_page_scripts_are_versioned_and_revalidated(client, site):
+    r = client.get("/")
+    assert r.headers["cache-control"] == "no-cache"
+    assert f'/static/app.js?v={site.APP_VERSION}"' in r.text and f'/static/style.css?v={site.APP_VERSION}"' in r.text
+    for path in ("/static/app.js", "/static/style.css"):
+        js = client.get(path)
+        assert js.status_code == 200 and js.headers["cache-control"] == "no-cache" and js.headers.get("etag")
+        again = client.get(path, headers={"If-None-Match": js.headers["etag"]})
+        assert again.status_code == 304                       # unchanged file costs one tiny request
+    assert client.get(f"/static/app.js?v={site.APP_VERSION}").status_code == 200

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2
+**Fixed: after an update the browser could keep running the OLD `app.js` against the NEW page** (symptom:
+`TypeError: Cannot set properties of null` when pressing a button, until Ctrl+F5). The page now links its script and
+style sheet with the version in the URL (`app.js?v=1.2.2`) and every static file is sent with
+`Cache-Control: no-cache`, so browsers re-check with the server each time (a cheap 304 when nothing changed).
+
 ## 1.2.1
 **Fixed: the app became very slow / unresponsive on gateways with a large history** (seen on a gateway with 81 active
 meters and 620 000 history rows: pages took 10-15 s, MQTT `Keep alive timeout` disconnects, and the update script's
